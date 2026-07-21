@@ -356,6 +356,11 @@ export async function POST(req: NextRequest) {
     const videoGenerationEnabled = req.headers.get('x-video-generation-enabled') === 'true';
     const mediaGenerationEnabled = imageGenerationEnabled || videoGenerationEnabled;
     const hasSourceImages = (pdfImages?.length ?? 0) > 0;
+    // [imageGen-trace] confirm server saw the toggles — log only on change so we
+    // can correlate the toggle with what the LLM actually received.
+    log.info(
+      `[imageGen-trace] outlines-stream headers image=${imageGenerationEnabled} video=${videoGenerationEnabled} media=${mediaGenerationEnabled}`,
+    );
 
     // Build teacher context from agents (if available)
     const teacherContext = formatTeacherPersonaForPrompt(agents);
@@ -596,6 +601,16 @@ export async function POST(req: NextRequest) {
           if (parsedOutlines.length > 0) {
             // Replace sequential gen_img_N/gen_vid_N with globally unique IDs
             const uniquifiedOutlines = uniquifyMediaElementIds(parsedOutlines);
+            // [imageGen-trace] did the LLM actually emit mediaGenerations? Count per type.
+            const withImg = uniquifiedOutlines.filter(
+              (o) => Array.isArray(o.mediaGenerations) && o.mediaGenerations.some((m) => m.type === 'image'),
+            ).length;
+            const withVid = uniquifiedOutlines.filter(
+              (o) => Array.isArray(o.mediaGenerations) && o.mediaGenerations.some((m) => m.type === 'video'),
+            ).length;
+            log.info(
+              `[imageGen-trace] LLM returned ${uniquifiedOutlines.length} outline(s); with-image=${withImg} with-video=${withVid} (header said image=${imageGenerationEnabled} video=${videoGenerationEnabled})`,
+            );
             // Send done event with all outlines
             const doneEvent = JSON.stringify({
               type: 'done',

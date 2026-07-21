@@ -38,18 +38,42 @@ export async function generateMediaForOutlines(
 
   // Collect all media requests
   const allRequests: MediaGenerationRequest[] = [];
+  const skippedByToggle: Array<{ type: string; elementId: string }> = [];
+  const skippedByStatus: Array<{ type: string; elementId: string; status: string }> = [];
   for (const outline of outlines) {
     if (!outline.mediaGenerations) continue;
     for (const mg of outline.mediaGenerations) {
       // Filter by enabled flags
-      if (mg.type === 'image' && !settings.imageGenerationEnabled) continue;
-      if (mg.type === 'video' && !settings.videoGenerationEnabled) continue;
+      if (mg.type === 'image' && !settings.imageGenerationEnabled) {
+        skippedByToggle.push({ type: mg.type, elementId: mg.elementId });
+        continue;
+      }
+      if (mg.type === 'video' && !settings.videoGenerationEnabled) {
+        skippedByToggle.push({ type: mg.type, elementId: mg.elementId });
+        continue;
+      }
       // Skip already completed or permanently failed (restored from DB)
       const existing = store.getTask(mg.elementId);
-      if (existing?.status === 'done' || existing?.status === 'failed') continue;
+      if (existing?.status === 'done' || existing?.status === 'failed') {
+        skippedByStatus.push({
+          type: mg.type,
+          elementId: mg.elementId,
+          status: existing.status,
+        });
+        continue;
+      }
       allRequests.push(mg);
     }
   }
+
+  // [imageGen-trace] confirm the orchestrator sees the toggle and what's getting
+  // filtered.  Helps spot the case where the LLM emitted mediaGenerations but
+  // settings.imageGenerationEnabled flipped to false on the client side.
+  log.info(
+    `[imageGen-trace] generateMediaForOutlines toggle image=${settings.imageGenerationEnabled} video=${settings.videoGenerationEnabled}; outlines=${outlines.length} total-mg=${
+      outlines.reduce((n, o) => n + (o.mediaGenerations?.length ?? 0), 0)
+    } to-run=${allRequests.length} skipped-by-toggle=${skippedByToggle.length} skipped-by-status=${skippedByStatus.length}`,
+  );
 
   if (allRequests.length === 0) return;
 
@@ -189,6 +213,12 @@ async function callImageApi(
 ): Promise<{ url: string }> {
   const settings = useSettingsStore.getState();
   const providerConfig = settings.imageProvidersConfig?.[settings.imageProviderId];
+  // [imageGen-trace] confirm we're actually calling the image endpoint with the
+  // expected provider/key.  If the key is missing this would be the silent failure
+  // surface for "toggle is on but no image ever gets generated".
+  log.info(
+    `[imageGen-trace] callImageApi elementId=${req.elementId} provider=${settings.imageProviderId} model=${settings.imageModelId} hasApiKey=${Boolean(providerConfig?.apiKey)} prompt=${req.prompt.slice(0, 60)}...`,
+  );
 
   const response = await fetch('/api/generate/image', {
     method: 'POST',

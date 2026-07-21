@@ -15,6 +15,7 @@ import { createLogger } from '@/lib/logger';
 import { MediaStageProvider } from '@/lib/contexts/media-stage-context';
 import { generateMediaForOutlines } from '@/lib/media/media-orchestrator';
 import { FixMissingTts } from '@/components/fix-missing-tts';
+import { ClassroomTtsEditor } from '@/components/classroom-tts-editor';
 import { useAgentRegistry } from '@/lib/orchestration/registry/store';
 import {
   applyClassroomStageAndScenes,
@@ -201,6 +202,7 @@ export default function ClassroomDetailPage() {
           )}
         </div>
         <FixMissingTts />
+        <ClassroomTtsEditor />
       </MediaStageProvider>
     </ThemeProvider>
   );

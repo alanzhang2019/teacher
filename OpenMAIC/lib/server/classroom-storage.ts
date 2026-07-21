@@ -80,6 +80,19 @@ export async function readClassroom(id: string): Promise<PersistedClassroomData 
 }
 
 /**
+ * Replace just the scene list for a classroom, leaving the stage
+ * metadata untouched. Forwards straight through to the active backend's
+ * `writeScenes`. Throws if the classroom id is unknown — callers can
+ * `readClassroom` first if they need a 404 vs 200 distinction.
+ */
+export async function writeClassroomScenes(
+  id: string,
+  scenes: PersistedClassroomData['scenes'],
+): Promise<void> {
+  await getClassroomStorage().writeScenes(id, scenes);
+}
+
+/**
  * Persist a classroom. Builds the `PersistedClassroomData` envelope
  * (adding `createdAt` if missing) and writes through the active backend.
  * Returns the persisted record plus the canonical share URL so the API

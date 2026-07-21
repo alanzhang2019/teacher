@@ -25,6 +25,10 @@
  */
 import type { Scene, Stage } from '@/lib/types/stage';
 
+// Re-export so the storage backends can `import type { Scene } from './types'`
+// without having to reach into the app-level stage types module.
+export type { Scene, Stage };
+
 /**
  * The persisted shape of a classroom. Re-exported from
  * `classroom-storage.ts` for back-compat with existing imports
@@ -51,6 +55,22 @@ export interface ClassroomStorage {
    * students who joined mid-deploy.
    */
   write(data: PersistedClassroomData): Promise<void>;
+
+  /**
+   * Replace just the scene list for a classroom, leaving the stage
+   * metadata untouched. Used by the teacher's client to push generated
+   * scenes incrementally without re-sending the full stage JSONB.
+   *
+   * Implementations must be atomic: either the full new scene list is
+   * visible after this returns, or the previous list is still intact.
+   * For fs this is a full-file rewrite under a temp-rename. For
+   * postgres this is a transaction (delete + insert in scenes table).
+   *
+   * Throws if the classroom id doesn't exist; callers should `read()`
+   * first if they need to distinguish missing-classroom from
+   * successful-empty-write.
+   */
+  writeScenes(id: string, scenes: Scene[]): Promise<void>;
 }
 
 export type ClassroomStorageBackend = 'fs' | 'postgres';

@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import type { ClassroomStorage } from './types';
-import type { PersistedClassroomData } from './types';
+import type { PersistedClassroomData, Scene } from './types';
 import { writeJsonFileAtomic } from './fs-utils';
 
 /**
@@ -36,5 +36,26 @@ export class FsClassroomStorage implements ClassroomStorage {
     await fs.mkdir(CLASSROOMS_DIR, { recursive: true });
     const filePath = path.join(CLASSROOMS_DIR, `${data.id}.json`);
     await writeJsonFileAtomic(filePath, data);
+  }
+
+  async writeScenes(id: string, scenes: Scene[]): Promise<void> {
+    // For the fs backend a "scenes-only" write is still a full-file rewrite
+    // — there's no partial-update path that wouldn't be racy with a
+    // concurrent `write()` from another tab. Read-modify-write under the
+    // same atomic-rename pattern `write()` uses.
+    const filePath = path.join(CLASSROOMS_DIR, `${id}.json`);
+    let current: PersistedClassroomData;
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      current = JSON.parse(content) as PersistedClassroomData;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error(
+          `FsClassroomStorage.writeScenes: classroom ${id} does not exist`,
+        );
+      }
+      throw error;
+    }
+    await writeJsonFileAtomic(filePath, { ...current, scenes });
   }
 }

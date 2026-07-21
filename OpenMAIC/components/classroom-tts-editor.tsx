@@ -399,8 +399,10 @@ export function ClassroomTtsEditor() {
   return (
     <>
       {/* Floating button — only render on the client after hydration so it
-          doesn't appear during the SSR pass and confuse the layout. */}
-      <div className="pointer-events-none fixed bottom-4 right-4 z-40 flex flex-col items-end gap-2">
+          doesn't appear during the SSR pass and confuse the layout.
+          z-[60] so it always sits on top of the FixMissingTts widget
+          (which uses z-50 in the same bottom-right corner). */}
+      <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex flex-col items-end gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <button

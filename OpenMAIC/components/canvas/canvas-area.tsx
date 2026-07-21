@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Play } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -12,6 +12,9 @@ import type { CanvasToolbarProps } from '@/components/canvas/canvas-toolbar';
 import type { Scene, StageMode } from '@/lib/types/stage';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { ClassroomCompletePageConnected } from '@/components/scene-renderers/classroom-complete';
+import { createLogger } from '@/lib/logger';
+
+const log = createLogger('CanvasArea');
 
 interface CanvasAreaProps extends CanvasToolbarProps {
   readonly currentScene: Scene | null;
@@ -50,6 +53,30 @@ export function CanvasArea({
   onRetryGeneration,
 }: CanvasAreaProps) {
   const { t } = useI18n();
+
+  // Diagnostic: log when canvas would render empty. Fires whenever the
+  // combination of `currentScene === null` + the overlay flags changes,
+  // which is the exact set of states that can produce the "black flash"
+  // reported during playback. Group consecutive same-state calls into a
+  // single log so 30+ frames of an empty canvas don't drown the console.
+  useEffect(() => {
+    if (currentScene) return;
+    log.warn('[empty-canvas] no currentScene', {
+      isPendingScene,
+      isCourseComplete,
+      isGenerationFailed,
+      currentSceneIndex,
+      scenesCount,
+    });
+  }, [
+    currentScene,
+    isPendingScene,
+    isCourseComplete,
+    isGenerationFailed,
+    currentSceneIndex,
+    scenesCount,
+  ]);
+
   const showControls = mode === 'playback' && !whiteboardOpen;
   const showPlayHint =
     showControls &&

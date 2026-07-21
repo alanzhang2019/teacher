@@ -20,10 +20,13 @@ import { CanvasArea } from '@/components/canvas/canvas-area';
 import { Roundtable } from '@/components/roundtable';
 import { PlaybackEngine, computePlaybackView } from '@/lib/playback';
 import type { EngineMode, TriggerEvent, Effect } from '@/lib/playback';
+import { createLogger } from '@/lib/logger';
 import {
   canJumpWithinReconstructablePrefix,
   isUnsafePlaybackNavigationAction,
 } from '@/lib/playback/action-navigation';
+
+const log = createLogger('PlaybackChromeRoot');
 import {
   getActionResumeRestoreCursor,
   clearActionResumePosition,
@@ -532,6 +535,22 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         !!currentScene?.actions &&
         (currentScene.actions.length > 0 || currentScene.type === 'slide');
       if (!currentScene || !hasPlayableActions) {
+        // Diagnostic: identify the "no currentScene" branch that produces
+        // the user-reported black flash. Distinguishes three sub-cases:
+        //  - noScene: currentSceneId pointed to a scene that doesn't exist
+        //  - pending: currentSceneId === PENDING_SCENE_ID (next scene still
+        //    generating on the server)
+        //  - emptyActions: scene exists but has no actions to play
+        log.warn('[empty-engine]', {
+          reason: !currentScene
+            ? currentSceneId === PENDING_SCENE_ID
+              ? 'pending'
+              : 'noScene'
+            : 'emptyActions',
+          currentSceneId,
+          sceneType: currentScene?.type,
+          actionCount: currentScene?.actions?.length ?? 0,
+        });
         engineRef.current = null;
         setEngineMode('idle');
         activeSceneIdRef.current = currentSceneId;

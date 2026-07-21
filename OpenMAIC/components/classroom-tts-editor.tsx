@@ -455,7 +455,13 @@ export function ClassroomTtsEditor() {
             </button>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-3 py-3">
+          <div className="flex-1 overflow-y-auto px-3 pb-[220px] pt-3">
+            {/* pb-[220px] leaves clearance for the FixMissingTts widget
+                (fixed bottom-4 right-4, roughly 180-200px tall). Without
+                it, the last speech action gets visually clipped by the
+                widget. 220px is a safe upper bound — when no missing
+                TTS, the widget is hidden and the padding is just dead
+                space at the bottom of the scroll area. */}
             {linesList.length === 0 ? (
               <div className="flex h-full flex-col items-center justify-center text-center text-xs text-muted-foreground">
                 <Mic className="mb-2 size-8 opacity-30" />

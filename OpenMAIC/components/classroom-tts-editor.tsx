@@ -134,21 +134,47 @@ export function ClassroomTtsEditor() {
   // Per-line state, keyed by `${sceneId}:${actionId}` so a scene switch
   // doesn't bleed unsaved drafts.
   const [lines, setLines] = useState<Record<string, LineState>>({});
+
+  // Stable refs / module-level singletons so the hydration effect doesn't
+  // see a "new" value every render. Without these, the effect would
+  // fire `setLines({})` with a fresh `{}` on every render and trip
+  // "Maximum update depth exceeded".
+  const EMPTY_LINES: Record<string, LineState> = useMemo(() => ({}), []);
   const sceneId = currentScene?.id ?? null;
   const sceneOrder = currentScene?.order ?? 0;
-  const actions = (currentScene?.actions ?? []).filter(
-    (a): a is { id: string; type: 'speech'; text: string; audioId?: string; audioUrl?: string } =>
-      a?.type === 'speech' && typeof a.id === 'string',
+  const actions = useMemo(
+    () =>
+      (currentScene?.actions ?? []).filter(
+        (a): a is {
+          id: string;
+          type: 'speech';
+          text: string;
+          audioId?: string;
+          audioUrl?: string;
+        } => a?.type === 'speech' && typeof a.id === 'string',
+      ),
+    [currentScene?.actions],
   );
 
   // Re-hydrate per-line state from the current scene's actions. We only
   // overwrite a line if its `originalText` matches what we last snapshot'd,
   // so an in-progress edit isn't clobbered by a scene re-render.
   const lastSceneIdRef = useRef<string | null>(null);
+  // Hash the speech action list so the effect re-runs only when the
+  // underlying text/audioId stamps change — not on every parent re-render
+  // (which would otherwise hand us a new `actions` array reference each time).
+  const actionsStamp = useMemo(
+    () => actions.map((a) => `${a.id}:${a.text ?? ''}:${a.audioId ?? ''}`).join('|'),
+    [actions],
+  );
   useEffect(() => {
     if (!sceneId) {
-      lastSceneIdRef.current = null;
-      setLines({});
+      // Don't pass a fresh `{}` here — that creates a new object every
+      // render and the effect would loop on `Maximum update depth`.
+      if (lastSceneIdRef.current !== null) {
+        lastSceneIdRef.current = null;
+        setLines(EMPTY_LINES);
+      }
       return;
     }
     if (lastSceneIdRef.current !== sceneId) {
@@ -169,8 +195,46 @@ export function ClassroomTtsEditor() {
         };
       }
       setLines(next);
+      return;
     }
-  }, [sceneId, actions]);
+    // Same scene, but the underlying text/audioId stamps may have been
+    // edited elsewhere (e.g. the global EditShell). Re-sync only when the
+    // stamp actually changes; the per-line dirty draft is preserved by
+    // skipping lines whose `originalText` already matches the new stamp.
+    setLines((prev) => {
+      let mutated = false;
+      const next: Record<string, LineState> = { ...prev };
+      for (const action of actions) {
+        const key = `${sceneId}:${action.id}`;
+        const existing = next[key];
+        if (!existing) {
+          next[key] = {
+            actionId: action.id,
+            draft: action.text ?? '',
+            originalText: action.text ?? '',
+            audioId: action.audioId,
+            voice: { kind: 'auto' },
+            regenerating: false,
+            error: null,
+            taskId: null,
+            ready: false,
+          };
+          mutated = true;
+          continue;
+        }
+        if (existing.originalText === (action.text ?? '')) continue;
+        if (existing.draft !== existing.originalText) continue; // user is editing
+        next[key] = {
+          ...existing,
+          originalText: action.text ?? '',
+          draft: action.text ?? '',
+          audioId: action.audioId,
+        };
+        mutated = true;
+      }
+      return mutated ? next : prev;
+    });
+  }, [sceneId, actionsStamp, actions, EMPTY_LINES]);
 
   // When a `tts-audio-ready` event fires for a line we own, mark it ready
   // so the per-line "试听" / regen button can flip to "✅ ready" state.

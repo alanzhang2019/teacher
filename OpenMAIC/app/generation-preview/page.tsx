@@ -1037,7 +1037,9 @@ function GenerationPreviewContent() {
         );
 
         for (const action of speechActions) {
-          const audioId = `tts_${action.id}`;
+          // Match use-scene-generator's canonical key (tts_s<sceneOrder>_<actionId>)
+          // so the audio is found by both pre-gen and post-gen playback paths.
+          const audioId = `tts_s${firstScene.order}_${action.id}`;
           action.audioId = audioId;
         }
 

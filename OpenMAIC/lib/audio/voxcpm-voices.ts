@@ -332,6 +332,18 @@ export async function getVoxCPMProviderOptions(
     };
   }
 
+  // Fail-fast: a clone profile whose reference audio blob is missing would
+  // otherwise silently fall back to a text-only prompt voice, which sounds
+  // like a completely different person (the exact "TTS 突然换了个人" bug).
+  // Surface the error so the caller logs a clear message and the user
+  // re-records the voice — instead of hearing a wrong voice with no warning.
+  if (profile.kind === 'clone' && !profile.referenceAudio) {
+    throw new Error(
+      `Clone voice profile "${profile.name}" (${profile.id}) is missing its reference audio blob. ` +
+        `Re-record the voice in AgentBar → Voice → 录制音色 to restore it.`,
+    );
+  }
+
   return {
     voiceMode: 'prompt',
     voicePrompt: profile.voicePrompt || profile.name,

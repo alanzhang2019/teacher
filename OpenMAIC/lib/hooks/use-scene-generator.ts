@@ -19,6 +19,7 @@ import { splitLongSpeechActions } from '@/lib/audio/tts-utils';
 import { measureAudioDuration } from '@/lib/audio/audio-duration';
 import { isTTSProviderEnabled } from '@/lib/audio/provider-enablement';
 import { resolveAgentVoiceOptions, pickNarratorAgent } from '@/lib/audio/agent-voice';
+import { VOXCPM_AUTO_VOICE_ID } from '@/lib/audio/voxcpm';
 import { useAgentRegistry } from '@/lib/orchestration/registry/store';
 import { generateMediaForOutlines } from '@/lib/media/media-orchestrator';
 import { lazyBoundedMap, mapWithConcurrency } from '@/lib/utils/concurrency';
@@ -270,12 +271,46 @@ export async function generateAndStoreTTS(
     teacherOverride && teacherOverride.providerId === settings.ttsProviderId
       ? teacherOverride.voiceId
       : settings.ttsVoice;
-  const providerOptions = await resolveAgentVoiceOptions(teacher, {
-    providerId: settings.ttsProviderId,
-    providerConfig: ttsProviderConfig,
-    voiceId: narrationVoiceId,
-    language,
-  });
+  // Voice resolution can throw — most commonly when a clone voice profile in
+  // IndexedDB lost its reference audio blob. We MUST NOT fall back to a
+  // text-only voice silently, or the user hears a different person with no
+  // warning. Log loudly and skip the TTS; the classroom will then fall back
+  // to silent playback (the on-screen speech text still shows) instead of
+  // playing a wrong voice.
+  let providerOptions: Record<string, unknown> | undefined;
+  try {
+    providerOptions = await resolveAgentVoiceOptions(teacher, {
+      providerId: settings.ttsProviderId,
+      providerConfig: ttsProviderConfig,
+      voiceId: narrationVoiceId,
+      language,
+    });
+  } catch (err) {
+    log.error(
+      `[TTS-bg] cannot resolve voice for ${audioId} (voiceId=${narrationVoiceId}):`,
+      err instanceof Error ? err.message : String(err),
+    );
+    // The picked voice (typically a clone profile) failed to resolve — most
+    // commonly because the IndexedDB reference-audio Blob is missing. Rather
+    // than silently skipping the scene and leaving the user with a silent
+    // classroom, fall back to `voxcpm:auto` so the audio at least plays,
+    // even if the timbre differs from the clone. The original voice is
+    // restored by re-recording the clone profile in AgentBar.
+    try {
+      providerOptions = await resolveAgentVoiceOptions(teacher, {
+        providerId: settings.ttsProviderId,
+        providerConfig: ttsProviderConfig,
+        voiceId: VOXCPM_AUTO_VOICE_ID,
+        language,
+      });
+    } catch (fallbackErr) {
+      log.error(
+        `[TTS-bg] auto-voice fallback also failed for ${audioId}; skipping TTS.`,
+        fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+      );
+      return;
+    }
+  }
   // Submit to the server-side persistent queue. The response comes back
   // immediately with a `taskId`; the actual VoxCPM call happens on the
   // Next.js dev process and survives this tab being closed. The status
@@ -306,7 +341,7 @@ async function submitBackgroundTTS(
   text: string,
   audioId: string,
   narrationVoiceId: string,
-  providerOptions: Record<string, unknown>,
+  providerOptions: Record<string, unknown> | undefined,
   signal?: AbortSignal,
 ): Promise<string | null> {
   const settings = useSettingsStore.getState();

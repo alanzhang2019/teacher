@@ -87,6 +87,12 @@ function AgentVoicePill({
   const previewCancelRef = useRef<(() => void) | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
+  // Mounted guard so async callbacks (audio ended/error, abort handlers)
+  // that fire after the component has been replaced by Next.js HMR / route
+  // change don't trigger React's "setState on a component that hasn't
+  // mounted yet" warning. React 19 still logs it in dev mode and Next.js's
+  // error overlay surfaces it as a console error.
+  const isMountedRef = useRef(true);
   const visibleProviderGroups = availableProviders
     .map((provider) => ({
       provider,
@@ -105,7 +111,8 @@ function AgentVoicePill({
     return resolved.voiceId;
   })();
 
-  const stopPreview = useCallback(() => {
+  // Cleanup only — safe to call from unmount paths (no setState).
+  const teardownPreview = useCallback(() => {
     previewCancelRef.current?.();
     previewCancelRef.current = null;
     previewAbortRef.current?.abort();
@@ -115,8 +122,17 @@ function AgentVoicePill({
       previewAudioRef.current.src = '';
       previewAudioRef.current = null;
     }
-    setPreviewingId(null);
   }, []);
+
+  const stopPreview = useCallback(() => {
+    teardownPreview();
+    // Guard so the unmount cleanup path (which intentionally doesn't go
+    // through this function — see useEffect below) and any in-flight async
+    // audio/ended callbacks can never call setState on an unmounted tree.
+    if (isMountedRef.current) {
+      setPreviewingId(null);
+    }
+  }, [teardownPreview]);
 
   const handlePreview = useCallback(
     async (providerId: TTSProviderId, voiceId: string, modelId?: string) => {
@@ -177,8 +193,16 @@ function AgentVoicePill({
 
         const audio = new Audio(`data:audio/${data.format || 'mp3'};base64,${data.base64}`);
         previewAudioRef.current = audio;
-        audio.addEventListener('ended', () => setPreviewingId(null));
-        audio.addEventListener('error', () => setPreviewingId(null));
+        // Guard the setState — if the user navigates away / HMR swaps this
+        // component between play() resolving and the ended/error event
+        // firing, the listener is otherwise the only thing still calling
+        // setState on the dead instance.
+        audio.addEventListener('ended', () => {
+          if (isMountedRef.current) setPreviewingId(null);
+        });
+        audio.addEventListener('error', () => {
+          if (isMountedRef.current) setPreviewingId(null);
+        });
         await audio.play();
       } catch {
         setPreviewingId(null);
@@ -196,8 +220,18 @@ function AgentVoicePill({
     ],
   );
 
-  // Cleanup on unmount
-  useEffect(() => () => stopPreview(), [stopPreview]);
+  // Cleanup on unmount — flip the mounted guard first, then tear down
+  // audio/abort state without going through setPreviewingId (the
+  // surrounding tree is being replaced, so any setState here would be
+  // reported as "setState on a component that hasn't mounted yet" by
+  // React 19 dev mode and surfaced by the Next.js error overlay).
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      teardownPreview();
+    };
+  }, [teardownPreview]);
 
   // Disabled (TTS off) OR no enabled provider ⇒ render the same muted,
   // non-interactive pill — don't silently hide the control (#665).
@@ -367,6 +401,12 @@ function TeacherVoicePill({
   const previewCancelRef = useRef<(() => void) | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
+  // Mounted guard so async callbacks (audio ended/error, abort handlers)
+  // that fire after the component has been replaced by Next.js HMR / route
+  // change don't trigger React's "setState on a component that hasn't
+  // mounted yet" warning. React 19 still logs it in dev mode and Next.js's
+  // error overlay surfaces it as a console error.
+  const isMountedRef = useRef(true);
   const visibleProviderGroups = availableProviders
     .map((provider) => ({
       provider,
@@ -387,7 +427,8 @@ function TeacherVoicePill({
     return ttsVoice || 'default';
   })();
 
-  const stopPreview = useCallback(() => {
+  // Cleanup only — safe to call from unmount paths (no setState).
+  const teardownPreview = useCallback(() => {
     previewCancelRef.current?.();
     previewCancelRef.current = null;
     previewAbortRef.current?.abort();
@@ -397,8 +438,17 @@ function TeacherVoicePill({
       previewAudioRef.current.src = '';
       previewAudioRef.current = null;
     }
-    setPreviewingId(null);
   }, []);
+
+  const stopPreview = useCallback(() => {
+    teardownPreview();
+    // Guard so the unmount cleanup path (which intentionally doesn't go
+    // through this function — see useEffect below) and any in-flight async
+    // audio/ended callbacks can never call setState on an unmounted tree.
+    if (isMountedRef.current) {
+      setPreviewingId(null);
+    }
+  }, [teardownPreview]);
 
   const handlePreview = useCallback(
     async (providerId: TTSProviderId, voiceId: string, modelId?: string) => {
@@ -457,8 +507,16 @@ function TeacherVoicePill({
         if (!data.base64) throw new Error('No audio');
         const audio = new Audio(`data:audio/${data.format || 'mp3'};base64,${data.base64}`);
         previewAudioRef.current = audio;
-        audio.addEventListener('ended', () => setPreviewingId(null));
-        audio.addEventListener('error', () => setPreviewingId(null));
+        // Guard the setState — if the user navigates away / HMR swaps this
+        // component between play() resolving and the ended/error event
+        // firing, the listener is otherwise the only thing still calling
+        // setState on the dead instance.
+        audio.addEventListener('ended', () => {
+          if (isMountedRef.current) setPreviewingId(null);
+        });
+        audio.addEventListener('error', () => {
+          if (isMountedRef.current) setPreviewingId(null);
+        });
         await audio.play();
       } catch {
         setPreviewingId(null);

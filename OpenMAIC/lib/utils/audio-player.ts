@@ -68,8 +68,16 @@ export class AudioPlayer {
         // queue stores completed audio under /audio-cache/<audioId>.wav and
         // is reachable via the status endpoint. Probe it once; if the audio
         // is there, fetch and cache it in IndexedDB for next time, then play.
+        //
+        // If that probe also misses, hand off to schedulePendingWait(): the
+        // server may still be synthesizing this audioId and the file will
+        // land on disk in the next few minutes. We fire-and-forget a poll
+        // and dispatch a `tts-audio-ready` window event the moment the file
+        // shows up, so the classroom UI can surface a "ready" toast without
+        // a hard refresh.
         const recovered = await this.tryRecoverFromServerQueue(audioId);
         if (!recovered) {
+          this.schedulePendingWait(audioId);
           // No pre-generated audio available anywhere; skip silently.
           return false;
         }
@@ -135,6 +143,19 @@ export class AudioPlayer {
   }
 
   /**
+   * Audio IDs we've already been asked to play but which had no audio on
+   * disk yet. We poll `/audio-cache/<id>.wav` in the background and fire
+   * a `tts-audio-ready` window event the moment one shows up, so the
+   * classroom UI can surface "audio ready — click to play" without
+   * forcing the user to refresh the page.
+   */
+  private readonly pendingWaits: Map<string, { timer: ReturnType<typeof setTimeout>; text?: string } > = new Map();
+
+  private static readonly PENDING_POLL_FIRST_MS = 5_000;
+  private static readonly PENDING_POLL_INTERVAL_MS = 30_000;
+  private static readonly PENDING_POLL_MAX_TRIES = 60; // ~30 min upper bound
+
+  /**
    * Try to pull a missing audio from the server-side TTS queue's on-disk
    * cache and persist it into IndexedDB. Returns true if a playable blob
    * is now in IndexedDB; false otherwise (still being synthesized, or no
@@ -174,6 +195,7 @@ export class AudioPlayer {
               createdAt: Date.now(),
             });
             log.info(`[AudioPlayer] recovered ${audioId} from /audio-cache/ (${bytes.length} bytes)`);
+            this.cancelPendingWait(audioId);
             return true;
           }
         }
@@ -210,10 +232,118 @@ export class AudioPlayer {
         createdAt: Date.now(),
       });
       log.info(`[AudioPlayer] recovered ${audioId} from server queue (${bytes.length} bytes)`);
+      this.cancelPendingWait(audioId);
       return true;
     } catch (err) {
       log.warn(`[AudioPlayer] server-queue recovery failed for ${audioId}:`, err);
       return false;
+    }
+  }
+
+  /**
+   * Background-poll `/audio-cache/<id>.wav` until it shows up (or we hit
+   * the timeout). The moment the file is reachable, fetch it into IndexedDB
+   * and dispatch a `tts-audio-ready` event on `window` so the classroom UI
+   * can show a "ready — click to play" affordance. This keeps the user
+   * from having to refresh the page every time a TTS finishes.
+   *
+   * Safe to call repeatedly: the Map de-dupes by audioId, and
+   * cancelPendingWait() runs from the success path to clean up.
+   */
+  public schedulePendingWait(audioId: string, text?: string): void {
+    if (!audioId) return;
+    if (this.pendingWaits.has(audioId)) {
+      if (text) this.pendingWaits.get(audioId)!.text = text;
+      return;
+    }
+    let tries = 0;
+    const tick = async () => {
+      if (this.pendingWaits.size === 0) return;
+      const entry = this.pendingWaits.get(audioId);
+      if (!entry) return;
+      tries += 1;
+      try {
+        const head = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav`, {
+          method: 'GET',
+          headers: { Range: 'bytes=0-0' },
+        });
+        if (head.ok || head.status === 206) {
+          // File is on disk. Pull the full blob into IndexedDB so the next
+          // play() hits the fast path. Then notify the UI.
+          try {
+            const audioResp = await fetch(
+              `/audio-cache/${encodeURIComponent(audioId)}.wav`,
+            );
+            if (audioResp.ok) {
+              const bytes = new Uint8Array(await audioResp.arrayBuffer());
+              if (bytes.length) {
+                const blob = new Blob([bytes], { type: 'audio/wav' });
+                await db.audioFiles.put({
+                  id: audioId,
+                  blob,
+                  duration: undefined,
+                  format: 'wav',
+                  createdAt: Date.now(),
+                });
+                log.info(
+                  `[AudioPlayer] pending-wait resolved: ${audioId} (${bytes.length} bytes, tried ${tries}x)`,
+                );
+                this.cancelPendingWait(audioId);
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(
+                    new CustomEvent('tts-audio-ready', {
+                      detail: { audioId, bytes: bytes.length, text: entry.text },
+                    }),
+                  );
+                }
+                return;
+              }
+            }
+          } catch (innerErr) {
+            log.warn(
+              `[AudioPlayer] pending-wait fetch failed for ${audioId}:`,
+              innerErr,
+            );
+          }
+        }
+      } catch (err) {
+        log.warn(`[AudioPlayer] pending-wait probe failed for ${audioId}:`, err);
+      }
+      if (tries >= AudioPlayer.PENDING_POLL_MAX_TRIES) {
+        log.warn(
+          `[AudioPlayer] pending-wait giving up on ${audioId} after ${tries} tries`,
+        );
+        this.cancelPendingWait(audioId);
+        return;
+      }
+      const timer = setTimeout(() => {
+        void tick();
+      }, AudioPlayer.PENDING_POLL_INTERVAL_MS);
+      this.pendingWaits.set(audioId, { timer, text: entry.text });
+    };
+    const timer = setTimeout(() => {
+      void tick();
+    }, AudioPlayer.PENDING_POLL_FIRST_MS);
+    this.pendingWaits.set(audioId, { timer, text });
+    log.info(
+      `[AudioPlayer] pending-wait scheduled for ${audioId} (first poll in ${AudioPlayer.PENDING_POLL_FIRST_MS}ms)`,
+    );
+  }
+
+  private cancelPendingWait(audioId: string): void {
+    const entry = this.pendingWaits.get(audioId);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this.pendingWaits.delete(audioId);
+  }
+
+  /**
+   * Cancel all background polls. Called on `destroy()` so the page can
+   * tear down without leaving dangling timers.
+   */
+  public cancelAllPendingWaits(): void {
+    for (const audioId of Array.from(this.pendingWaits.keys())) {
+      this.cancelPendingWait(audioId);
     }
   }
 
@@ -320,6 +450,7 @@ export class AudioPlayer {
    * Destroy the player
    */
   public destroy(): void {
+    this.cancelAllPendingWaits();
     this.stop();
     this.onEndedCallback = null;
   }

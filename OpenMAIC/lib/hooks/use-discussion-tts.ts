@@ -11,6 +11,7 @@ import {
 import { isTTSProviderEnabled } from '@/lib/audio/provider-enablement';
 import { useVoxCPMVoiceProfiles } from '@/lib/audio/voxcpm-voices';
 import { resolveAgentVoiceOptions } from '@/lib/audio/agent-voice';
+import { VOXCPM_AUTO_VOICE_ID } from '@/lib/audio/voxcpm';
 import type { AgentConfig } from '@/lib/orchestration/registry/types';
 import type { TTSProviderId } from '@/lib/audio/types';
 import type { AudioIndicatorState } from '@/components/roundtable/audio-indicator';
@@ -195,12 +196,44 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
     try {
       const providerConfig = ttsProvidersConfig[item.providerId];
       const agent = item.agentId ? agents.find((a) => a.id === item.agentId) : undefined;
-      const providerOptions = await resolveAgentVoiceOptions(agent, {
-        providerId: item.providerId,
-        providerConfig: { ...providerConfig, modelId: item.modelId || providerConfig?.modelId },
-        voiceId: item.voiceId,
-        language: locale,
-      });
+      // Voice resolution can throw when a clone voice profile lost its
+      // reference audio blob (see lib/audio/voxcpm-voices.ts fail-fast).
+      // Surface the error in the console and skip this TTS turn instead of
+      // silently playing a wrong-voice fallback.
+      let providerOptions: Record<string, unknown> | undefined;
+      try {
+        providerOptions = await resolveAgentVoiceOptions(agent, {
+          providerId: item.providerId,
+          providerConfig: { ...providerConfig, modelId: item.modelId || providerConfig?.modelId },
+          voiceId: item.voiceId,
+          language: locale,
+        });
+      } catch (resolveErr) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[DiscussionTTS] cannot resolve voice for agent ${item.agentId} (voiceId=${item.voiceId}); falling back to voxcpm:auto so the line still plays. Re-record the clone voice in AgentBar to restore the original timbre.`,
+          resolveErr instanceof Error ? resolveErr.message : String(resolveErr),
+        );
+        // Try the auto voice so the discussion line at least has audio (a
+        // different voice, but not silent). If even this fails, give up
+        // gracefully and reset the indicator so the UI doesn't stay stuck.
+        try {
+          providerOptions = await resolveAgentVoiceOptions(agent, {
+            providerId: item.providerId,
+            providerConfig: { ...providerConfig, modelId: item.modelId || providerConfig?.modelId },
+            voiceId: VOXCPM_AUTO_VOICE_ID,
+            language: locale,
+          });
+        } catch (fallbackErr) {
+          // eslint-disable-next-line no-console
+          console.error(
+            `[DiscussionTTS] auto-voice fallback also failed for agent ${item.agentId}; skipping turn.`,
+            fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+          );
+          onAudioStateChangeRef.current?.(item.agentId, 'idle');
+          return;
+        }
+      }
       const res = await fetch('/api/generate/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

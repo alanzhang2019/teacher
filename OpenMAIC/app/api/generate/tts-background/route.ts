@@ -19,8 +19,16 @@
  */
 
 import { NextRequest } from 'next/server';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
-import { enqueueTTS, getTTSTask, listTTSTasks, type TTSTaskInput } from '@/lib/server/tts-queue';
+import {
+  enqueueTTS,
+  getTTSTask,
+  listTTSTasks,
+  renameCachedAudio,
+  type TTSTaskInput,
+} from '@/lib/server/tts-queue';
 import {
   isServerConfiguredProvider,
   isServerTTSProviderDisabled,
@@ -127,19 +135,41 @@ export async function GET(req: NextRequest) {
   const id = req.nextUrl.searchParams.get('id');
   if (id) {
     const task = getTTSTask(id);
-    if (!task) {
-      return apiError('NOT_FOUND', 404, `No TTS task with id ${id}`);
+    if (task) {
+      return apiSuccess({
+        id: task.id,
+        status: task.status,
+        audioPath: task.audioPath,
+        bytes: task.bytes,
+        error: task.error,
+        createdAt: task.createdAt,
+        startedAt: task.startedAt,
+        completedAt: task.completedAt,
+      });
     }
-    return apiSuccess({
-      id: task.id,
-      status: task.status,
-      audioPath: task.audioPath,
-      bytes: task.bytes,
-      error: task.error,
-      createdAt: task.createdAt,
-      startedAt: task.startedAt,
-      completedAt: task.completedAt,
-    });
+    // Fallback: in-memory task not found (e.g. dev server restarted after the
+    // worker wrote the WAV but before `task.status = 'completed'` was
+    // persisted). The audio file on disk is the source of truth for the
+    // "is the clip done" question, so promote it to completed and let the
+    // client fetch it.
+    try {
+      const audioPath = `/audio-cache/${id}.wav`;
+      const filePath = path.join(process.cwd(), 'public', audioPath);
+      const stat = await fs.stat(filePath);
+      if (stat.isFile() && stat.size > 0) {
+        return apiSuccess({
+          id,
+          status: 'completed',
+          audioPath,
+          bytes: stat.size,
+          createdAt: stat.mtimeMs,
+          completedAt: stat.mtimeMs,
+        });
+      }
+    } catch {
+      // file truly missing — fall through to 404
+    }
+    return apiError('NOT_FOUND', 404, `No TTS task with id ${id}`);
   }
   // No id: list a small summary so dev can confirm what's queued.
   const all = listTTSTasks();
@@ -149,4 +179,40 @@ export async function GET(req: NextRequest) {
     completed: all.filter((t) => t.status === 'completed').length,
     failed: all.filter((t) => t.status === 'failed').length,
   });
+}
+
+/**
+ * PATCH /api/generate/tts-background
+ * Body: { from: string, to: string } — rename `public/audio-cache/<from>.wav`
+ * to `public/audio-cache/<to>.wav` so the classroom player (which fetches
+ * `/audio-cache/<audioId>.wav` based on the stage's `action.audioId`) can
+ * reach a file the legacy code already produced. Used by FixMissingTts after
+ * rewriting legacy `tts_<actionId>` audioIds to the canonical
+ * `tts_s<sceneOrder>_<actionId>` form.
+ */
+export async function PATCH(req: NextRequest) {
+  try {
+    const body = (await req.json()) as { from?: string; to?: string };
+    const { from, to } = body;
+    if (!from || !to) {
+      return apiError('MISSING_REQUIRED_FIELD', 400, 'from and to are required');
+    }
+    const result = await renameCachedAudio(from, to);
+    if (!result.ok) {
+      // 'missing' is not a server fault — surface as 404 to keep the client
+      // logic simple; the client will then enqueue a fresh TTS under the new
+      // key.
+      if (result.reason === 'missing') {
+        return apiError('NOT_FOUND', 404, `No cached audio for ${from}.wav`);
+      }
+      return apiError('INTERNAL_ERROR', 500, result.error ?? 'rename failed');
+    }
+    return apiSuccess({ from, to, reason: result.reason });
+  } catch (err) {
+    return apiError(
+      'INTERNAL_ERROR',
+      500,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 }

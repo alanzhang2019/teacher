@@ -16,6 +16,8 @@
     "check:i18n-keys": "node scripts/check-i18n-keys.mjs",
     "check": "prettier . --check",
     "format": "prettier . --write",
+    "precommit:install": "node scripts/install-hooks.mjs",
+    "precommit:uninstall": "node scripts/install-hooks.mjs --uninstall",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",

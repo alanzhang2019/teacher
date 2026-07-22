@@ -22,6 +22,26 @@ function Write-Ok  ($msg) { Write-Host "[start_all] $msg" -ForegroundColor Green
 function Write-Warn($msg) { Write-Host "[start_all] $msg" -ForegroundColor Yellow }
 
 # ----------------------------------------------------------------------------
+# -clean: stop everything, nuke .next/ and node_modules/.cache/, then start.
+# Use when the dev server is in a broken state (e.g. MODULE_NOT_FOUND for
+# @swc+helpers, _app.js, routes-manifest.json — typical after kill+restart
+# cycles or power loss).
+# ----------------------------------------------------------------------------
+if ($args -contains '-clean' -or $args -contains '--clean') {
+  Write-Step "(-clean) stopping existing instances..."
+  & (Join-Path $PSScriptRoot 'stop_all.ps1')
+
+  foreach ($rel in @('.next', 'node_modules/.cache')) {
+    $abs = Join-Path $RepoDir $rel
+    if (Test-Path $abs) {
+      Write-Step "(-clean) removing $rel"
+      Remove-Item -Recurse -Force $abs
+    }
+  }
+  Write-Ok "(-clean) cache cleared; continuing with fresh start"
+}
+
+# ----------------------------------------------------------------------------
 # 0) 确保只启动一份 — 如果已运行则提示并退出
 # ----------------------------------------------------------------------------
 $port3000 = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue
@@ -35,7 +55,7 @@ if ($port3000 -or $port8000 -or $watchdogPids) {
   if ($port3000) { Write-Warn "  - port 3000 PID=$($port3000.OwningProcess)" }
   if ($port8000) { Write-Warn "  - port 8000 PID=$($port8000.OwningProcess)" }
   if ($watchdogPids) { Write-Warn "  - watchdog.ps1 PIDs: $($watchdogPids -join ', ')" }
-  Write-Warn "如需重启请先跑 stop_all.ps1"
+  Write-Warn "如需重启请先跑 stop_all.ps1，或加 -clean 标志一键清缓存重启"
   exit 0
 }
 

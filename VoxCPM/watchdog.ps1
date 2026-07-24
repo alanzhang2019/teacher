@@ -74,6 +74,44 @@ function Get-ServerPids {
     return $hits
 }
 
+function Get-ServerPyBuckets {
+    # Partition server.py processes by their executable path. The reason this
+    # exists: the main loop used to treat every python.exe whose CommandLine
+    # contained "server.py" as a uvicorn worker of the tracked parent and
+    # quietly ignored it. That assumption breaks the moment the user (or a
+    # stale shell) launches a server.py with a *different* Python interpreter
+    # (typically the system Python311 at
+    # `C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe`)
+    # — those processes are real foreign server.py instances, not uvicorn
+    # workers, and they can sit on port 8000 with /health still answering,
+    # which is exactly the failure mode that left an unpatched server.py
+    # running through a stop_all / start_all cycle. Splitting by executable
+    # path lets the main loop kill the foreign ones while leaving the real
+    # uvicorn workers alone.
+    #
+    # Returns a hashtable with two arrays of [int] PIDs:
+    #   - VenvOwned : the python.exe is $VenvPython (i.e. something we / a
+    #                 uvicorn worker spawned; safe to leave alone).
+    #   - Foreign   : the python.exe is some other interpreter (system
+    #                 Python, another venv, msys python, ...). These are
+    #                 orphans and must be recycled, not adopted.
+    $procs     = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue
+    $venvOwned = @()
+    $foreign   = @()
+    foreach ($p in $procs) {
+        if ($p.CommandLine -and $p.CommandLine.Contains('server.py')) {
+            $exe = $p.ExecutablePath
+            if ($exe -and ($exe -eq $VenvPython)) {
+                $venvOwned += [int]$p.ProcessId
+            } else {
+                # Record where it actually came from so the log line is actionable.
+                $foreign += [int]$p.ProcessId
+            }
+        }
+    }
+    return @{ VenvOwned = $venvOwned; Foreign = $foreign; }
+}
+
 function Get-TrackedServerPid {
     # Read the PID we last wrote in Start-Server. Returns $null if the file
     # is missing, unparseable, or the process is no longer alive.
@@ -227,7 +265,70 @@ while ($true) {
 
     $listening   = Test-PortListening -Port $Port
     $trackedPid  = Get-TrackedServerPid
-    $serverPids  = @(Get-ServerPids)  # informational; uvicorn forks a worker so count >= 1 is normal
+    $buckets     = Get-ServerPyBuckets
+    $venvOwned   = @($buckets.VenvOwned)
+    $foreign     = @($buckets.Foreign)
+    $serverPids  = @($venvOwned + $foreign)  # informational; uvicorn forks a worker so count >= 1 is normal
+
+    # Foreign server.py (a python.exe that is NOT $VenvPython but is holding
+    # the port) is a hard conflict: it answers /health, so the rest of the
+    # loop's "tracked alive + port up" branch would happily mark service OK
+    # forever, never noticing that the new server.py (with the funASR auto-
+    # fill patch) is being starved out. This is the exact regression mode
+    # that left an unpatched system-Python server.py running through a
+    # stop_all / start_all cycle. Kill the foreign process first; if it was
+    # actually the one holding 8000, the port will go down on the next tick
+    # and the normal "port down" branch will spin up a fresh, venv-owned one.
+    #
+    # Important carve-out: if a "foreign" PID's parent is OUR tracked pid, it
+    # is almost certainly a VoxCPM inference worker that the tracked server
+    # spawned internally (WMI reports its ExecutablePath as the system
+    # Python311 because of how the venv's pyvenv.cfg / sys._base_executable
+    # resolves on Windows, but the process is actually loading the venv's
+    # site-packages and is the one that bound port 8000). Killing it
+    # cascade-kills the tracked parent and forces a 90s model reload. Skip
+    # these — the "extra venv-owned" branch below would also have ignored
+    # them, but the executable-path mismatch made them look foreign first.
+    if ($foreign.Count -gt 0) {
+        $foreignInfo = ($foreign | ForEach-Object {
+            $p = Get-CimInstance Win32_Process -Filter "ProcessId=$_" -ErrorAction SilentlyContinue
+            $exe = if ($p) { $p.ExecutablePath } else { '?' }
+            $cmd = if ($p) { $p.CommandLine } else { '?' }
+            $parent = if ($p) { $p.ParentProcessId } else { '?' }
+            "$_ (exe=$exe, ppid=$parent, cmd=$(if ($cmd.Length -gt 80) { $cmd.Substring(0, 80) + '...' } else { $cmd }))"
+        }) -join '; '
+        Write-Watchdog "Foreign server.py detected (not from $VenvPython): $foreignInfo. Tracked=$trackedPid."
+        $killList = @()
+        $skipList = @()
+        foreach ($fp in $foreign) {
+            $p = Get-CimInstance Win32_Process -Filter "ProcessId=$fp" -ErrorAction SilentlyContinue
+            $ppid = if ($p) { [int]$p.ParentProcessId } else { 0 }
+            if ($trackedPid -and $ppid -eq [int]$trackedPid) {
+                $skipList += $fp
+            } else {
+                $killList += $fp
+            }
+        }
+        if ($skipList.Count -gt 0) {
+            Write-Watchdog "Skipping $($skipList.Count) foreign-but-child-of-tracked pid(s) (assumed VoxCPM inference worker): $($skipList -join ', '). Will treat as extra venv-owned."
+            $venvOwned = @($venvOwned + $skipList)
+            # Fall through to the normal venv-owned ignore branch below.
+        }
+        if ($killList.Count -gt 0) {
+            Write-Watchdog "Killing $($killList.Count) foreign server.py pid(s) (not our tracked's children): $($killList -join ', '). Recycling."
+            foreach ($fp in $killList) {
+                try { Stop-Process -Id $fp -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            # Give the OS a moment to reap the socket. If a venv-owned tracked
+            # server is also up, it'll take over port 8000 on its own; if not,
+            # the next tick will see port-down and start a fresh venv server.
+            Start-Sleep -Seconds 2
+            $consecutiveHealthFails = 0
+            continue
+        }
+        # All foreign pids were actually children of our tracked server —
+        # fall through to the normal port-up branches below (no kill, no restart).
+    }
 
     if (-not $listening) {
         # Port down. If a tracked process is still alive, give it more time
@@ -253,22 +354,26 @@ while ($true) {
         continue
     }
 
-    # Port is listening. If we have a tracked server AND there are extra
-    # server.py processes holding resources, we just log and ignore them.
-    # Rationale: uvicorn forks a worker whose CommandLine also contains
-    # "server.py" and which holds the loaded 5GB model. Killing the worker
-    # would force a 90s model reload on the next start — far worse than
-    # the extra memory cost of letting the worker live. The worker will
-    # be reaped naturally when the tracked parent dies (port goes down).
-    if ($trackedPid -and $serverPids.Count -gt 1) {
-        $foreignOnes = @($serverPids | Where-Object { $_ -ne $trackedPid })
-        if ($foreignOnes.Count -gt 0) {
-            $foreignInfo = ($foreignOnes | ForEach-Object {
+    # Port is listening. If we have a tracked server AND there are additional
+    # *venv-owned* server.py processes, those are uvicorn workers — we log and
+    # ignore them. Rationale: uvicorn forks a worker whose CommandLine also
+    # contains "server.py" and which holds the loaded 5GB VoxCPM model.
+    # Killing the worker would force a 90s model reload on the next start
+    # — far worse than the extra memory cost of letting the worker live. The
+    # worker will be reaped naturally when the tracked parent dies (port
+    # goes down). Foreign (non-venv) server.py processes are handled in the
+    # dedicated branch above; they should never reach this point, but if
+    # one does we surface it instead of silently ignoring it (would re-
+    # introduce the stop_all / start_all regression).
+    if ($trackedPid -and $venvOwned.Count -gt 1) {
+        $extras = @($venvOwned | Where-Object { $_ -ne $trackedPid })
+        if ($extras.Count -gt 0) {
+            $extraInfo = ($extras | ForEach-Object {
                 $p = Get-CimInstance Win32_Process -Filter "ProcessId=$_" -ErrorAction SilentlyContinue
                 $parent = if ($p) { $p.ParentProcessId } else { '?' }
                 "$_ (PPID=$parent)"
             }) -join '; '
-            Write-Watchdog "Ignoring $($foreignOnes.Count) extra server.py pid(s) (likely uvicorn workers): $foreignInfo. Tracked=$trackedPid, service OK."
+            Write-Watchdog "Ignoring $($extras.Count) extra venv-owned server.py pid(s) (uvicorn workers): $extraInfo. Tracked=$trackedPid, service OK."
         }
         continue
     }

@@ -14,6 +14,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -55,6 +56,64 @@ _inference_executor = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="voxcpm-infer",
 )
+
+
+# ---------------------------------------------------------------------------
+# ASR auto-fill singleton (lazy). We recover `prompt_text` from a clone
+# voice's reference audio on demand so VoxCPM can switch to its stronger
+# `prompt-continuation` mode. See /tts/upload below for the call site.
+# ---------------------------------------------------------------------------
+_asr_model = None
+_asr_lock = threading.Lock()
+
+
+def _get_asr_model():
+    """Lazy-load funASR Paraformer on first ASR request.
+
+    funASR is bundled with the VoxCPM venv (it ships with VoxCPM2's
+    training/recipe tooling) but we keep it out of the cold-start path so
+    the server can come up in ~10s on a CPU machine. The first clone
+    regenerate that needs it will pay a one-time ~5-15s model load
+    (Paraformer-zh is small); subsequent calls reuse the singleton.
+    The first call also has to download the model weights once from
+    ModelScope (~300MB) — handled by funasr.AutoModel and cached on
+    disk afterwards.
+    """
+    global _asr_model
+    if _asr_model is not None:
+        return _asr_model
+    with _asr_lock:
+        if _asr_model is not None:
+            return _asr_model
+        log.info("asr: loading funASR Paraformer (first call, may download weights)...")
+        from funasr import AutoModel  # local import — heavy dep
+        _asr_model = AutoModel(model="paraformer-zh", disable_update=True)
+        log.info("asr: funASR ready")
+    return _asr_model
+
+
+def _asr_transcribe(wav_path: str) -> str:
+    """Run funASR on a wav file and return the concatenated text.
+
+    Best-effort: any failure is logged and the caller falls back to
+    reference-only mode. We do NOT raise — a missing prompt_text is a
+    quality degradation, not a hard error.
+    """
+    try:
+        model = _get_asr_model()
+        result = model.generate(input=wav_path)
+        if not result:
+            return ""
+        # funASR returns a list[dict] with key "text" containing the
+        # decoded string (possibly with sentence-piece spaces).
+        text = (result[0].get("text") or "").strip()
+        # funASR inserts spaces between every Chinese character; collapse them.
+        text = re.sub(r"\s+", "", text)
+        log.info(f"asr: transcribed {len(text)} chars from {wav_path}: {text[:60]}...")
+        return text
+    except Exception as e:
+        log.warning(f"asr: transcription failed for {wav_path}: {e}")
+        return ""
 
 
 def get_model():

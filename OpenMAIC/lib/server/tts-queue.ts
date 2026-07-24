@@ -336,26 +336,85 @@ async function processTask(task: TTSTask): Promise<void> {
 
   try {
     const { text, ttsProviderId, ttsModelId, ttsVoice, ttsSpeed, ttsApiKey, ttsBaseUrl, ttsProviderOptions } = task.input;
-    // Fast mode: if the caller opted into `fast: true` on the task input, we
-    // force the lowest-cost VoxCPM pass and **drop the reference audio
-    // entirely**. The reference audio is the dominant cost in clone mode
-    // (single clone inference: 26-50 min on CPU vs 60-120s without).
+    // CRITICAL diagnostic — log the raw input the worker ACTUALLY received
+    // for this task, BEFORE the voicePrompt / promptText extraction. The
+    // browser-side [ClassroomTtsEditor] buildProviderOptions log shows the
+    // client's intent, but if a profile was recorded without a
+    // `voicePrompt` description (the user's first clone profile had
+    // voicePrompt=null promptText=null), the rendered output sounds like
+    // the auto voice even though reference_audio is being sent. Without
+    // this log line, the only signal is the eventual audio — and on
+    // reference-only mode VoxCPM's timbre can drift enough that the user
+    // can't tell clone from auto. Pinning the wire shape to the console
+    // makes the regression mode ("voicePrompt missing → fall back to
+    // reference-only → timbre drifts") self-evident.
+    // eslint-disable-next-line no-console
+    console.log(
+      `[tts-queue] ${task.id} input: ` +
+        `ttsVoice=${ttsVoice} ` +
+        `provider=${ttsProviderId} ` +
+        `voicePrompt=${JSON.stringify((ttsProviderOptions as { voicePrompt?: string } | undefined)?.voicePrompt || null)} ` +
+        `promptText=${JSON.stringify(((ttsProviderOptions as { promptText?: string } | undefined)?.promptText || '').slice(0, 30) || null)} ` +
+        `refAudioBytes=${typeof (ttsProviderOptions as { referenceAudioBase64?: string } | undefined)?.referenceAudioBase64 === 'string' ? Math.round(((ttsProviderOptions as { referenceAudioBase64: string }).referenceAudioBase64.length) * 0.75) : 0}`,
+    );
+    // The `voicePrompt` is the inline voice-design description (e.g. "a calm
+    // female teacher"). VoxCPM needs it prepended to the text as `(voice
+    // prompt)text` for the inline-prompt path. Without this wrapping the
+    // reference audio is sent but the voice design is ignored — VoxCPM falls
+    // back to an auto-derived voice from the text content, which sounds like a
+    // completely different person (the "TTS 突然换了个人" bug).
     //
-    // Trade-off: the resulting voice will be the auto-derived VoxCPM voice
-    // (per-persona, but not the user's clone). The user accepts this in
-    // exchange for a 1-2 hour queue tail instead of a 16-28 hour tail.
-    //
-    // The shape of `ttsProviderOptions` is intentionally not preserved
-    // (we don't trust client input to set its own fast flag — it's an
-    // admin-only escape hatch from FixMissingTts's "加速" button).
+    // When `promptText` (the actual words in the reference audio) is provided
+    // alongside the reference audio, the python-api backend switches to
+    // "prompt continuation" mode: text is sent as-is, the reference audio is
+    // uploaded as `prompt_audio` with `prompt_text`, and the inline prefix is
+    // not needed. So the inline wrapping only applies when we are NOT in that
+    // mode (i.e. no prompt continuation).
     const fastMode =
       typeof (task.input as { fast?: unknown }).fast === 'boolean' &&
       (task.input as { fast?: boolean }).fast === true;
     const effectiveOptions = fastMode ? undefined : ttsProviderOptions;
+    const voicePrompt =
+      !fastMode && typeof effectiveOptions?.voicePrompt === 'string'
+        ? (effectiveOptions.voicePrompt as string)
+        : undefined;
+    const referenceAudioBase64 =
+      !fastMode && typeof effectiveOptions?.referenceAudioBase64 === 'string'
+        ? (effectiveOptions.referenceAudioBase64 as string)
+        : undefined;
+    const referenceAudioMimeType =
+      !fastMode && typeof effectiveOptions?.referenceAudioMimeType === 'string'
+        ? (effectiveOptions.referenceAudioMimeType as string)
+        : undefined;
+    const referenceAudioName =
+      !fastMode && typeof effectiveOptions?.referenceAudioName === 'string'
+        ? (effectiveOptions.referenceAudioName as string)
+        : undefined;
+    const promptText =
+      !fastMode && typeof effectiveOptions?.promptText === 'string'
+        ? (effectiveOptions.promptText as string)
+        : undefined;
+    // Mirrors `buildVoxCPMTargetText` in lib/audio/tts-providers.ts so the
+    // queue path produces the same `(voice prompt)text` shape that the
+    // synchronous /api/generate/tts route sends. Duplicated rather than
+    // imported to keep this server module free of the (browser-aware)
+    // tts-providers dependency.
+    const cleanedVoicePrompt = voicePrompt
+      ?.replace(/[\p{C}]+/gu, ' ')
+      .replace(/[()（）]/gu, '')
+      .replace(/\s+/gu, ' ')
+      .trim();
+    const usePromptContinuation = Boolean(
+      referenceAudioBase64 && promptText?.trim(),
+    );
+    const finalTargetText = usePromptContinuation || !cleanedVoicePrompt
+      ? text
+      : `(${cleanedVoicePrompt})${text}`;
+
     const result = await postVoxCPMPythonAPI(
       ttsBaseUrl || process.env.TTS_VOXCPM_BASE_URL || 'http://localhost:8000',
       {
-        targetText: text,
+        targetText: finalTargetText,
         cfgValue: typeof effectiveOptions?.cfgValue === 'number' ? (effectiveOptions.cfgValue as number) : 2.0,
         inferenceTimesteps: fastMode
           ? 10
@@ -372,31 +431,28 @@ async function processTask(task: TTSTask): Promise<void> {
           : typeof effectiveOptions?.denoise === 'boolean'
             ? (effectiveOptions.denoise as boolean)
             : false,
-        // Fast mode deliberately omits the reference audio / prompt. Drop
-        // every field that would re-enable the slow clone path.
-        referenceAudioBase64: fastMode
-          ? undefined
-          : typeof effectiveOptions?.referenceAudioBase64 === 'string'
-            ? (effectiveOptions.referenceAudioBase64 as string)
-            : undefined,
-        referenceAudioMimeType: fastMode
-          ? undefined
-          : typeof effectiveOptions?.referenceAudioMimeType === 'string'
-            ? (effectiveOptions.referenceAudioMimeType as string)
-            : undefined,
-        referenceAudioName: fastMode
-          ? undefined
-          : typeof effectiveOptions?.referenceAudioName === 'string'
-            ? (effectiveOptions.referenceAudioName as string)
-            : undefined,
-        promptText: fastMode
-          ? undefined
-          : typeof effectiveOptions?.promptText === 'string'
-            ? (effectiveOptions.promptText as string)
-            : undefined,
+        referenceAudioBase64,
+        referenceAudioMimeType,
+        referenceAudioName,
+        promptText,
       },
       ttsApiKey,
     );
+    // Surface the dispatch shape in the server log so the operator can
+    // confirm the inline-prompt / prompt-continuation path is being taken
+    // for a clone voice — without this, a stuck "wrong-voice" output looks
+    // identical to a correct one and the only signal is the eventual audio.
+    if (!fastMode && (voicePrompt || promptText || referenceAudioBase64)) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[tts-queue] ${task.id} dispatch: ` +
+          `mode=${usePromptContinuation ? 'prompt-continuation' : cleanedVoicePrompt ? 'inline-prompt' : 'plain'}, ` +
+          `textLen=${finalTargetText.length}, ` +
+          `hasRefAudio=${!!referenceAudioBase64}, ` +
+          `hasPromptText=${!!promptText}, ` +
+          `voicePrompt=${cleanedVoicePrompt ? '"' + cleanedVoicePrompt.slice(0, 40) + (cleanedVoicePrompt.length > 40 ? '…' : '') + '"' : 'none'}`,
+      );
+    }
 
     // Honor a cancellation that landed while the long inference was in
     // flight. Discard the bytes — the task is already marked cancelled and

@@ -37,11 +37,14 @@ import {
   Check,
   X,
   ChevronRight,
+  Pause,
 } from 'lucide-react';
 import { useStageStore } from '@/lib/store';
 import { useSettingsStore } from '@/lib/store/settings';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useVoxCPMVoiceProfiles } from '@/lib/audio/voxcpm-voices';
+import { createAudioPlayer } from '@/lib/utils/audio-player';
+import { db } from '@/lib/utils/database';
 import { cn } from '@/lib/utils';
 import { createLogger } from '@/lib/logger';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -87,13 +90,75 @@ function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
+ * Best-effort ASR transcription of a clone voice's reference audio.
+ *
+ * The user-facing symptom: a clone profile was recorded with reference
+ * audio but the "参考音频对应文本" and "音色描述" fields were left empty
+ * (or never shown — the recorder UI doesn't always gate on them). When
+ * that profile is reused for "重新生成" VoxCPM is fed only `reference_audio`
+ * and falls into `reference-only` mode, whose timbre drifts toward the
+ * model's auto default and the user concludes "还是 auto".
+ *
+ * The cheapest fix is to pull the text that the user *actually said* in
+ * the reference audio out of the audio itself. If we can supply
+ * `promptText` to VoxCPM the worker switches to `prompt-continuation`
+ * mode (`prompt_wav_path` + `prompt_text` together), which is the
+ * strongest of the three VoxCPM clone paths and gives a markedly
+ * tighter match to the recorded voice. The ASR pass is best-effort —
+ * if it fails or the provider isn't configured, we still POST the
+ * request and let the worker fall back to reference-only.
+ */
+async function transcribeReferenceAudio(
+  audio: Blob,
+  audioName: string,
+  asrConfig: { providerId: string; modelId?: string; apiKey?: string; baseUrl?: string; language?: string } | null,
+): Promise<string | null> {
+  if (!asrConfig) {
+    // eslint-disable-next-line no-console
+    console.log('[ClassroomTtsEditor] ASR auto-fill skipped: no ASR provider configured.');
+    return null;
+  }
+  try {
+    const form = new FormData();
+    form.set('audio', audio, audioName);
+    form.set('providerId', asrConfig.providerId);
+    if (asrConfig.modelId) form.set('modelId', asrConfig.modelId);
+    if (asrConfig.apiKey) form.set('apiKey', asrConfig.apiKey);
+    if (asrConfig.baseUrl) form.set('baseUrl', asrConfig.baseUrl);
+    if (asrConfig.language) form.set('language', asrConfig.language);
+    const resp = await fetch('/api/transcription', { method: 'POST', body: form });
+    if (!resp.ok) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[ClassroomTtsEditor] ASR auto-fill failed: ${resp.status} ${resp.statusText}. VoxCPM will run in reference-only mode.`,
+      );
+      return null;
+    }
+    const json = (await resp.json()) as { success?: boolean; data?: { text?: string } } | { text?: string };
+    const text = (json as { data?: { text?: string } }).data?.text ?? (json as { text?: string }).text;
+    const trimmed = (text ?? '').trim();
+    if (!trimmed) return null;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[ClassroomTtsEditor] ASR auto-fill -> promptText(${trimmed.length} chars)="${trimmed.slice(0, 60)}${trimmed.length > 60 ? '…' : ''}"`,
+    );
+    return trimmed;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[ClassroomTtsEditor] ASR auto-fill threw; reference-only fallback', err);
+    return null;
+  }
+}
+
+/**
  * Build the `ttsProviderOptions` payload for `/api/generate/tts-background`.
  * Mirrors the shape the route handler in app/api/generate/tts-background/route.ts
  * forwards to `postVoxCPMPythonAPI`.
  */
 async function buildProviderOptions(
   voice: VoiceChoice,
-  profile: { referenceAudio?: Blob; voicePrompt?: string; referenceAudioName?: string; referenceAudioMimeType?: string } | null,
+  profile: { referenceAudio?: Blob; voicePrompt?: string; promptText?: string; referenceAudioName?: string; referenceAudioMimeType?: string } | null,
+  asrConfig: { providerId: string; modelId?: string; apiKey?: string; baseUrl?: string; language?: string } | null = null,
 ): Promise<Record<string, unknown>> {
   if (voice.kind === 'auto') {
     // Auto: cheapest pass, no reference audio. Same shape as tts-queue
@@ -109,7 +174,49 @@ async function buildProviderOptions(
   if (!profile?.referenceAudio) {
     throw new Error('克隆音色已丢失 reference audio（请到 AgentBar 重新录制）');
   }
+  // If the clone profile was recorded without the optional `promptText`
+  // (the words the user said in the reference clip), try to recover it
+  // by ASR-transcribing the reference audio. This puts VoxCPM into
+  // `prompt-continuation` mode and gives a much tighter timbre match
+  // than `reference-only` — see transcribeReferenceAudio docstring.
+  let effectivePromptText = profile.promptText?.trim() || '';
+  if (!effectivePromptText) {
+    const asrText = await transcribeReferenceAudio(
+      profile.referenceAudio,
+      profile.referenceAudioName ?? 'reference.wav',
+      asrConfig,
+    );
+    if (asrText) effectivePromptText = asrText;
+  }
   const base64 = await blobToBase64(profile.referenceAudio);
+  // Diagnose what we are about to POST so the user can confirm in the
+  // browser console whether the clone voice options (voicePrompt,
+  // promptText, reference audio) are actually being sent. The previous
+  // "TTS 重生成音色没变" bug had three independent failure modes
+  // (worker dropped voicePrompt, editor dropped promptText, IDB held
+  // the old blob) and the only signal was the eventual audio — this
+  // log makes the *intent* visible before the network round-trip.
+  // eslint-disable-next-line no-console
+  console.log(
+    `[ClassroomTtsEditor] buildProviderOptions(clone) -> ` +
+      `voicePrompt=${JSON.stringify(profile.voicePrompt || null)} ` +
+      `promptText=${JSON.stringify(effectivePromptText.slice(0, 40) || null)} ` +
+      `(promptTextSource=${profile.promptText ? 'profile' : effectivePromptText ? 'asr-autofill' : 'none'}) ` +
+      `refAudioBytes=${Math.round(base64.length * 0.75)} ` +
+      `mimeType=${profile.referenceAudioMimeType ?? profile.referenceAudio?.type ?? 'audio/wav'}`,
+  );
+  if (!profile.voicePrompt && !effectivePromptText) {
+    // Reference-only fallback. Loud warning so the operator can see why
+    // the output may sound auto-ish even though the clone profile is
+    // selected. See the transcribeReferenceAudio docstring for context.
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[ClassroomTtsEditor] clone profile is missing BOTH voicePrompt and promptText (ASR auto-fill also failed). ' +
+        'VoxCPM will run in reference-only mode. Re-record the voice in Settings → TTS → VoxCPM → 录制音色 and fill in: ' +
+        '(1) a voice design description (e.g. "a calm female teacher speaking standard Mandarin"), AND ' +
+        '(2) the exact words you said in the reference audio. Both fields are required for prompt-continuation mode.',
+    );
+  }
   return {
     cfgValue: 2.0,
     inferenceTimesteps: 10,
@@ -118,7 +225,20 @@ async function buildProviderOptions(
     referenceAudioBase64: base64,
     referenceAudioMimeType: profile.referenceAudioMimeType ?? profile.referenceAudio.type ?? 'audio/wav',
     referenceAudioName: profile.referenceAudioName ?? 'reference.wav',
+    // Voice design description (e.g. "a calm female teacher"). The queue
+    // worker reads this and wraps the text as `(voicePrompt)text` so VoxCPM
+    // uses the inline voice-design path; without it, the reference audio
+    // is sent but the voice design is dropped, and VoxCPM produces a
+    // different-sounding person.
     voicePrompt: profile.voicePrompt,
+    // The literal words the user said in the reference audio. When
+    // present together with `referenceAudioBase64`, VoxCPM's python-api
+    // backend switches to "prompt continuation" mode (text is sent as-is
+    // and `prompt_text` is uploaded alongside `prompt_audio`) which
+    // generally gives a stronger clone timbre than the inline-prefix
+    // path. The agent-bar recorder writes this when the user records a
+    // voice with reference text, so always forward it.
+    promptText: effectivePromptText || undefined,
   };
 }
 
@@ -128,6 +248,24 @@ export function ClassroomTtsEditor() {
   const currentScene = useStageStore((s) => s.getCurrentScene());
   const ttsProviderId = useSettingsStore((s) => s.ttsProviderId);
   const ttsProviderConfig = useSettingsStore((s) => s.ttsProvidersConfig?.[ttsProviderId]);
+  // ASR config used as a fallback for the auto-fill of `promptText` when a
+  // clone profile was recorded without "参考音频对应文本". See
+  // transcribeReferenceAudio() in this file for the rationale. We only
+  // forward providerId/modelId/apiKey/baseUrl (everything the
+  // /api/transcription route actually consumes) — `language` defaults to
+  // 'auto' on the server when omitted, so we let the server pick.
+  const asrProviderId = useSettingsStore((s) => s.asrProviderId);
+  const asrProviderConfig = useSettingsStore((s) => s.asrProvidersConfig?.[asrProviderId]);
+  const asrLanguage = useSettingsStore((s) => s.asrLanguage);
+  const asrConfig = asrProviderId
+    ? {
+        providerId: asrProviderId,
+        modelId: asrProviderConfig?.modelId,
+        apiKey: asrProviderConfig?.apiKey,
+        baseUrl: asrProviderConfig?.baseUrl,
+        language: asrLanguage,
+      }
+    : null;
   const updateScene = useStageStore((s) => s.updateScene);
   const { profiles, loading: profilesLoading } = useVoxCPMVoiceProfiles();
 
@@ -238,11 +376,32 @@ export function ClassroomTtsEditor() {
 
   // When a `tts-audio-ready` event fires for a line we own, mark it ready
   // so the per-line "试听" / regen button can flip to "✅ ready" state.
+  //
+  // Also auto-play the new take when the audio-player is idle. The user's
+  // typical "重新生成" flow is: click regenerate, wait 1-2 min for the
+  // worker, then *expect* to hear the new voice. Forcing them to click
+  // the preview button again after every regen breaks the flow. The
+  // preflight (see regenerate) already cleared the IDB blob and stopped
+  // any in-flight audio, so auto-playing now will land on the fresh take
+  // and the user immediately hears the new voice — which is the whole
+  // point of the regenerate button.
+  //
+  // We skip auto-play when something else is already playing (a different
+  // line, or the main playback engine driving through the scene) to
+  // avoid stomping on the user's intent.
   useEffect(() => {
     const handler = (ev: Event) => {
       const detail = (ev as CustomEvent<{ audioId: string }>).detail;
       const audioId = detail?.audioId;
       if (!audioId) return;
+      const player = createAudioPlayer();
+      const wasIdle = !player.isPlaying() && !player.hasActiveAudio();
+      // First, find which (if any) local line matches this audioId and was
+      // regenerating. We need this BEFORE we mutate state so the auto-play
+      // decision is based on the previous snapshot. Doing the read outside
+      // the setLines updater also keeps the updater pure (no setState
+      // inside another setState, which React 18 will warn about).
+      let autoPlayKey: string | null = null;
       setLines((prev) => {
         let mutated = false;
         const next = { ...prev };
@@ -250,10 +409,20 @@ export function ClassroomTtsEditor() {
           if (line.audioId === audioId) {
             next[key] = { ...line, ready: true, regenerating: false };
             mutated = true;
+            if (line.regenerating) autoPlayKey = key;
           }
         }
         return mutated ? next : prev;
       });
+      if (wasIdle && autoPlayKey) {
+        const key = autoPlayKey;
+        setPreviewingKey(key);
+        void player.play(audioId).catch((playErr) => {
+          log.warn('[ClassroomTtsEditor] auto-play after regen failed', playErr);
+          setPreviewingKey(null);
+        });
+        schedulePreviewTimeout(key);
+      }
     };
     window.addEventListener('tts-audio-ready', handler);
     return () => window.removeEventListener('tts-audio-ready', handler);
@@ -311,7 +480,7 @@ export function ClassroomTtsEditor() {
       // Resolve clone profile (if chosen) so we can attach reference audio
       // + voicePrompt to the enqueue payload. The discriminated union narrows
       // `line.voice` to {kind:'clone', profileId, name} on the first check.
-      let profile: { referenceAudio?: Blob; voicePrompt?: string; referenceAudioName?: string; referenceAudioMimeType?: string } | null = null;
+      let profile: { referenceAudio?: Blob; voicePrompt?: string; promptText?: string; referenceAudioName?: string; referenceAudioMimeType?: string } | null = null;
       if (line.voice.kind === 'clone') {
         const profileId = line.voice.profileId;
         const hit = profiles.find((p) => p.id === profileId);
@@ -319,6 +488,7 @@ export function ClassroomTtsEditor() {
           ? {
               referenceAudio: hit.referenceAudio,
               voicePrompt: hit.voicePrompt,
+              promptText: hit.promptText,
               referenceAudioName: hit.referenceAudioName,
               referenceAudioMimeType: hit.referenceAudioMimeType,
             }
@@ -326,7 +496,7 @@ export function ClassroomTtsEditor() {
       }
       let options: Record<string, unknown>;
       try {
-        options = await buildProviderOptions(line.voice, profile);
+        options = await buildProviderOptions(line.voice, profile, asrConfig);
       } catch (err) {
         updateLine(key, {
           error: err instanceof Error ? err.message : String(err),
@@ -335,6 +505,39 @@ export function ClassroomTtsEditor() {
         return;
       }
       updateLine(key, { regenerating: true, error: null, ready: false });
+      // CRITICAL — invalidate the cached old take BEFORE the new take lands.
+      // Background TTS takes 1-2 minutes on CPU; if the user clicks the
+      // preview button during that window, `player.play(audioId)` resolves
+      // the blob from IndexedDB — which still holds the previous (auto) take
+      // — and the audio element pins that blob via a blob URL. Even after
+      // the worker writes the new clone take and `schedulePendingWait`
+      // overwrites the IDB record, the audio element keeps streaming the
+      // stale blob because the snapshot is held by reference. The visible
+      // symptom: the user clicks "重新生成", waits, hears… the old auto
+      // voice, and concludes the clone switch never took. Verified against
+      // the 2026-07-24 repro on the "原本 auto 改克隆重新生成" path.
+      //
+      // Deleting the IDB row first forces the next `play(audioId)` to miss
+      // IndexedDB, fall through to `tryRecoverFromServerQueue` /
+      // `schedulePendingWait`, and either fetch the new take as soon as it
+      // lands on disk or simply wait. We also `player.stop()` so any audio
+      // element already pinned to the old blob releases its reference and
+      // the queue / ready toast can flow through to the next play attempt.
+      try {
+        createAudioPlayer().stop();
+        // The audio-player module already statically imports `db` from
+        // `@/lib/utils/database`, so the Dexie instance is guaranteed to be
+        // initialized here too. Drop the cached blob so the next play()
+        // either hits the freshly-written on-disk WAV (via
+        // tryRecoverFromServerQueue) or polls via schedulePendingWait
+        // until the worker finishes — never the stale auto take.
+        await db.audioFiles.delete(audioId);
+      } catch (preflightErr) {
+        // Non-fatal: the worst case is the user keeps hearing the old
+        // blob on the in-flight audio element. Log so the operator can
+        // see the preflight failed.
+        log.warn('[ClassroomTtsEditor] preflight invalidate failed', preflightErr);
+      }
       try {
         const resp = await fetch('/api/generate/tts-background', {
           method: 'POST',
@@ -369,12 +572,41 @@ export function ClassroomTtsEditor() {
         const taskId = json?.data?.taskId ?? json?.taskId ?? null;
         // Stamp the new audioId onto the action so the player can resolve it
         // as soon as audio-player writes the WAV to IDB.
+        //
+        // Also clear audioUrl. classroom-media-generation.ts sets BOTH
+        // `audioId` and `audioUrl` on the speech action when the orchestrator
+        // synthesizes TTS during scene creation. lib/utils/audio-player.ts
+        // resolves audio via `play(audioId, audioUrl)` and the URL wins
+        // over the IDB lookup, so if we don't drop the URL here, the
+        // player keeps streaming the *original* (auto-voice) WAV from the
+        // server even after the new clone take is written to IDB. The
+        // signature symptom is "originally-auto line switched to clone
+        // still sounds like auto on next play" — confirmed in the
+        // 2026-07-24 repro.
         const nextActions = actions.map((a) => {
           if (a?.id !== line.actionId || a.type !== 'speech') return a;
-          return { ...a, audioId } as typeof a;
+          const beforeUrl = (a as { audioUrl?: string }).audioUrl;
+          const next = { ...a, audioId } as typeof a;
+          delete (next as { audioUrl?: string }).audioUrl;
+          if (beforeUrl) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[ClassroomTtsEditor] regenerate: cleared stale audioUrl on action ${line.actionId} (was ${beforeUrl.slice(0, 80)}…)`,
+            );
+          }
+          return next;
         });
         updateScene(sceneId, { actions: nextActions });
         updateLine(key, { taskId, audioId, regenerating: false });
+        // Hand the audioId to the player's pending-wait poller. The
+        // background worker will eventually write the regenerated WAV to
+        // `/audio-cache/<audioId>.wav`; without this, the play() path would
+        // short-circuit on the old blob still cached in IndexedDB and the
+        // user would keep hearing the previous (wrong-voice) take even
+        // though the new file is already on disk. The poller fetches the
+        // fresh file as soon as it lands, overwrites the IDB entry, and
+        // fires `tts-audio-ready` so this row flips to "已就绪".
+        createAudioPlayer().schedulePendingWait(audioId, line.draft);
         log.info(`[ClassroomTtsEditor] enqueued ${audioId} (taskId=${taskId})`);
       } catch (err) {
         updateLine(key, {
@@ -385,6 +617,126 @@ export function ClassroomTtsEditor() {
     },
     [lines, sceneId, sceneOrder, profiles, ttsProviderConfig, currentScene, updateScene, updateLine],
   );
+
+  /**
+   * Play the current take for a single line from inside the editor drawer.
+   * Mirrors what the main classroom player does, but scoped to one
+   * audioId — so the user can immediately verify the cloned voice after
+   * a regenerate, without leaving the drawer or letting the rest of the
+   * scene play out. Goes through the same audio-player singleton (which
+   * hits IndexedDB first, falls back to the on-disk WAV), so any byte
+   * difference between the old and new takes shows up audibly here too.
+   *
+   * Toggle semantics: if the player is already playing THIS line, the
+   * click pauses; if it's playing a different line or nothing, the
+   * click switches to (or starts) this line. Tracks the active key in
+   * `previewingKey` so the LineRow can flip its icon between Volume2
+   * and Pause.
+   */
+  const [previewingKey, setPreviewingKey] = useState<string | null>(null);
+  // Auto-clear previewingKey when the audio finishes naturally. We can't
+  // listen for the audio element's 'ended' event directly (the audio-player
+  // is a singleton shared with the main classroom view, and its
+  // onEndedCallback is a single function), so we use a timer scheduled
+  // at play() time and cancelled on pause / scene change. The 60s ceiling
+  // is well past any TTS line and the timer is always cancelled as soon
+  // as the user toggles again, so this is a worst-case fallback.
+  const previewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearPreviewTimeout = useCallback(() => {
+    if (previewTimeoutRef.current !== null) {
+      clearTimeout(previewTimeoutRef.current);
+      previewTimeoutRef.current = null;
+    }
+  }, []);
+  useEffect(() => {
+    // Scene / drawer swap => any in-flight preview belongs to the
+    // previous context. Reset.
+    setPreviewingKey(null);
+    clearPreviewTimeout();
+  }, [sceneId, sceneOrder, clearPreviewTimeout]);
+  useEffect(() => () => clearPreviewTimeout(), [clearPreviewTimeout]);
+  const previewLine = useCallback(
+    async (key: string) => {
+      const line = lines[key];
+      if (!line || !sceneId) return;
+      const audioId = line.audioId ?? `tts_s${sceneOrder}_${line.actionId}`;
+      // Diagnostic — surfaces the resolved audioId in the browser console
+      // so we can correlate the preview click with the IDB record and the
+      // on-disk WAV. The user's earlier "still hears auto after
+      // regenerate" symptom was traced to a stale audioUrl winning over
+      // this exact IDB lookup, so logging it makes the resolution path
+      // explicit.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[ClassroomTtsEditor] preview ${key}: audioId=${audioId} (line.audioId=${line.audioId ?? 'unset'})`,
+      );
+      const player = createAudioPlayer();
+      try {
+        // Same audioId already loaded and actively playing -> pause it.
+        // Same audioId loaded but paused -> resume.
+        // Different audioId (or nothing loaded) -> play fresh.
+        const currentId = player.getCurrentAudioId();
+        // eslint-disable-next-line no-console
+        console.log(
+          `[ClassroomTtsEditor] preview ${key}: branch-decide currentId=${currentId ?? 'null'} audioId=${audioId} isPlaying=${player.isPlaying()}`,
+        );
+        if (currentId === audioId) {
+          if (player.isPlaying()) {
+            // eslint-disable-next-line no-console
+            console.log(`[ClassroomTtsEditor] preview ${key}: -> pause()`);
+            player.pause();
+            setPreviewingKey(null);
+            clearPreviewTimeout();
+          } else {
+            // eslint-disable-next-line no-console
+            console.log(`[ClassroomTtsEditor] preview ${key}: -> resume()`);
+            await player.resume();
+            setPreviewingKey(key);
+            schedulePreviewTimeout(key);
+          }
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[ClassroomTtsEditor] preview ${key}: -> play(audioId) (fresh)`,
+          );
+          // Starting a fresh play stops any in-flight audio (the
+          // singleton's play() calls stopAudioElement() internally), so
+          // the previously-previewing line, if any, is no longer
+          // playing — clear its key too.
+          const ok = await player.play(audioId);
+          if (!ok) {
+            updateLine(key, {
+              error: '没有可播放的音频（先生成 / 等队列写盘）',
+            });
+            setPreviewingKey(null);
+            clearPreviewTimeout();
+          } else {
+            updateLine(key, { error: null });
+            setPreviewingKey(key);
+            schedulePreviewTimeout(key);
+          }
+        }
+      } catch (err) {
+        log.warn('[ClassroomTtsEditor] preview failed', err);
+        updateLine(key, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        setPreviewingKey(null);
+        clearPreviewTimeout();
+      }
+    },
+    [lines, sceneId, sceneOrder, updateLine, clearPreviewTimeout],
+  );
+  const schedulePreviewTimeout = useCallback((key: string) => {
+    clearPreviewTimeout();
+    previewTimeoutRef.current = setTimeout(() => {
+      // Only clear if the key still matches — user might have started
+      // a different preview in the meantime (already handled by the
+      // fresh-play branch above, but this guards against races).
+      setPreviewingKey((cur) => (cur === key ? null : cur));
+      previewTimeoutRef.current = null;
+    }, 60_000);
+  }, [clearPreviewTimeout]);
 
   const linesList = useMemo(() => {
     if (!sceneId) return [];
@@ -479,10 +831,12 @@ export function ClassroomTtsEditor() {
                       line={line}
                       profiles={profiles}
                       profilesLoading={profilesLoading}
+                      isPreviewing={previewingKey === key}
                       onTextChange={(text) => updateLine(key, { draft: text })}
                       onCommit={() => commitText(key, line.draft)}
                       onVoiceChange={(voice) => updateLine(key, { voice })}
                       onRegenerate={() => void regenerate(key)}
+                      onPreview={() => void previewLine(key)}
                     />
                   );
                 })}
@@ -510,20 +864,26 @@ interface LineRowProps {
     voicePrompt?: string;
   }>;
   profilesLoading: boolean;
+  /** True when the audio-player is currently playing this row's take
+   *  (and the click would therefore pause rather than start fresh). */
+  isPreviewing: boolean;
   onTextChange: (text: string) => void;
   onCommit: () => void;
   onVoiceChange: (voice: VoiceChoice) => void;
   onRegenerate: () => void;
+  onPreview: () => void;
 }
 
 function LineRow({
   line,
   profiles,
   profilesLoading,
+  isPreviewing,
   onTextChange,
   onCommit,
   onVoiceChange,
   onRegenerate,
+  onPreview,
 }: LineRowProps) {
   const isDirty = line.draft !== line.originalText;
   const voiceSummary =
@@ -570,6 +930,34 @@ function LineRow({
             </option>
           ))}
         </select>
+        {/* Per-line "试听" / pause toggle — when `isPreviewing` is true the
+            row is currently playing through the audio-player singleton, so
+            the click pauses and the icon flips to a Pause glyph. Disabled
+            when the line is mid-regenerate (no committed audio yet) or has
+            no audioId. */}
+        <button
+          type="button"
+          onClick={onPreview}
+          disabled={!line.audioId || line.regenerating}
+          className={cn(
+            'inline-flex shrink-0 items-center justify-center rounded-md border px-1.5 py-1 transition-colors disabled:opacity-40',
+            isPreviewing
+              ? 'border-amber-400 bg-amber-100 text-amber-800 hover:bg-amber-200 dark:border-amber-600 dark:bg-amber-900/40 dark:text-amber-200'
+              : 'border-sky-300 bg-sky-100 text-sky-800 hover:bg-sky-200 dark:border-sky-700 dark:bg-sky-900/30 dark:text-sky-200',
+          )}
+          title={
+            !line.audioId
+              ? '还没有可播放的音频（先重新生成）'
+              : line.regenerating
+                ? '生成中，无法试听'
+                : isPreviewing
+                  ? '暂停这一行 TTS'
+                  : '只播放这一行 TTS（用于核对克隆音色）'
+          }
+          aria-label={isPreviewing ? '暂停这一行' : '试听这一行'}
+        >
+          {isPreviewing ? <Pause className="size-3" /> : <Volume2 className="size-3" />}
+        </button>
         <button
           type="button"
           onClick={onRegenerate}

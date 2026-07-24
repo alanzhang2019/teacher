@@ -31,6 +31,22 @@ export class AudioPlayer {
   }
 
   /**
+   * The audioId of the audio currently loaded in `this.audio`. Lets callers
+   * (e.g. the per-line preview button in ClassroomTtsEditor) tell whether
+   * the player is already playing the audio they want, so they can toggle
+   * pause/resume instead of starting a fresh playback each click. Reset
+   * to `null` whenever the underlying audio element is replaced or
+   * explicitly stopped.
+   */
+  private currentAudioId: string | null = null;
+
+  /** Returns the audioId of the audio currently loaded for playback, or
+   *  null if no audio is loaded. */
+  public getCurrentAudioId(): string | null {
+    return this.currentAudioId;
+  }
+
+  /**
    * Play audio (from URL or IndexedDB pre-generated cache)
    * @param audioId Audio ID
    * @param audioUrl Optional server-generated audio URL (takes priority over IndexedDB)
@@ -39,6 +55,7 @@ export class AudioPlayer {
   public async play(audioId: string, audioUrl?: string): Promise<boolean> {
     const requestToken = ++this.requestToken;
     try {
+      this.currentAudioId = audioId;
       // 1. Try audioUrl first (server-generated TTS)
       if (audioUrl) {
         this.stopAudioElement();
@@ -117,6 +134,7 @@ export class AudioPlayer {
       // Set ended callback
       this.audio.addEventListener('ended', () => {
         URL.revokeObjectURL(blobUrl);
+        this.currentAudioId = null;
         this.onEndedCallback?.();
       });
 
@@ -176,13 +194,23 @@ export class AudioPlayer {
     // dev server's static-file handler returns 404 for HEAD on /public/*
     // even when the file exists, while GET works. The 1-byte body tells us
     // the file is there without paying the full audio download cost.
+    //
+    // CRITICAL: pass `cache: 'no-store'` on every fetch here. The audioId
+    // is stable across regenerations (the editor reuses `tts_s<N>_<id>`),
+    // so the URL never changes — without this hint, the browser happily
+    // hands back the previous take from HTTP cache, the recovery path
+    // writes THAT blob into IDB, and the user keeps hearing the old voice
+    // even after the queue worker wrote a new WAV to disk.
     try {
-      const head = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav`, {
+      const head = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav?_=${Date.now()}`, {
         method: 'GET',
         headers: { Range: 'bytes=0-0' },
+        cache: 'no-store',
       });
       if (head.ok || head.status === 206) {
-        const audioResp = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav`);
+        const audioResp = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav?_=${Date.now()}`, {
+          cache: 'no-store',
+        });
         if (audioResp.ok) {
           const bytes = new Uint8Array(await audioResp.arrayBuffer());
           if (bytes.length) {
@@ -263,20 +291,42 @@ export class AudioPlayer {
       if (!entry) return;
       tries += 1;
       try {
-        const head = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav`, {
+        // Cache-bust the probe: the editor reuses the same audioId
+        // (tts_s<N>_<actionId>) across regenerations, so the URL is
+        // identical. Without `cache: 'no-store'` (and the timestamp
+        // query param as belt-and-suspenders) the browser would happily
+        // return the previous take from its HTTP cache, the pending-wait
+        // path would dutifully overwrite IDB with the OLD blob, and the
+        // user would keep hearing the previous (wrong-voice) audio even
+        // though the queue worker just wrote a fresh WAV to disk.
+        const head = await fetch(`/audio-cache/${encodeURIComponent(audioId)}.wav?_=${Date.now()}`, {
           method: 'GET',
           headers: { Range: 'bytes=0-0' },
+          cache: 'no-store',
         });
         if (head.ok || head.status === 206) {
           // File is on disk. Pull the full blob into IndexedDB so the next
           // play() hits the fast path. Then notify the UI.
           try {
             const audioResp = await fetch(
-              `/audio-cache/${encodeURIComponent(audioId)}.wav`,
+              `/audio-cache/${encodeURIComponent(audioId)}.wav?_=${Date.now()}`,
+              { cache: 'no-store' },
             );
             if (audioResp.ok) {
               const bytes = new Uint8Array(await audioResp.arrayBuffer());
               if (bytes.length) {
+                // Compare against the previously-cached IDB record so the
+                // operator can see in the dev console whether the new take
+                // is byte-for-byte identical to the previous one (model
+                // produced the same output — usually a voice-prompt config
+                // issue) or genuinely different (cache-stale fix worked).
+                let previousBytes: number | null = null;
+                try {
+                  const existing = await db.audioFiles.get(audioId);
+                  previousBytes = existing?.blob?.size ?? null;
+                } catch {
+                  // IDB read failure is non-fatal — log the bytes anyway.
+                }
                 const blob = new Blob([bytes], { type: 'audio/wav' });
                 await db.audioFiles.put({
                   id: audioId,
@@ -286,7 +336,8 @@ export class AudioPlayer {
                   createdAt: Date.now(),
                 });
                 log.info(
-                  `[AudioPlayer] pending-wait resolved: ${audioId} (${bytes.length} bytes, tried ${tries}x)`,
+                  `[AudioPlayer] pending-wait resolved: ${audioId} ` +
+                    `(new=${bytes.length} bytes, prev=${previousBytes ?? 'none'}, tried ${tries}x)`,
                 );
                 this.cancelPendingWait(audioId);
                 if (typeof window !== 'undefined') {
@@ -363,6 +414,7 @@ export class AudioPlayer {
   public stop(): void {
     this.requestToken += 1;
     this.stopAudioElement();
+    this.currentAudioId = null;
     // Note: onEndedCallback intentionally NOT cleared here because play()
     // calls stop() internally — clearing would break the callback chain.
     // Stale callbacks are harmless: engine mode check prevents processNext().
@@ -457,8 +509,23 @@ export class AudioPlayer {
 }
 
 /**
- * Create an audio player instance
+ * Audio-player factory.
+ *
+ * Singleton by design. The classroom page (PlaybackChromeRoot) and the
+ * per-line preview button in ClassroomTtsEditor both call createAudioPlayer()
+ * freely — without a shared instance, each call would return a fresh
+ * `AudioPlayer` whose `currentAudioId` is `null`, and the preview toggle
+ * could never reach the `pause()` branch (the precondition `currentId ===
+ * audioId` would never hold, so every click would route to the "fresh
+ * play" branch and the audio would keep restarting instead of pausing).
+ *
+ * PlaybackChromeRoot wraps the call in `useRef(createAudioPlayer())` —
+ * that pattern still works with a singleton (the ref just keeps a stable
+ * reference to the same shared instance) and avoids the React 18 strict
+ * mode double-invocation cost of running the constructor twice.
  */
+let _singleton: AudioPlayer | null = null;
 export function createAudioPlayer(): AudioPlayer {
-  return new AudioPlayer();
+  if (!_singleton) _singleton = new AudioPlayer();
+  return _singleton;
 }

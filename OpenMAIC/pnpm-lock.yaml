@@ -351,6 +351,9 @@ importers:
       '@playwright/test':
         specifier: ^1.58.2
         version: 1.58.2
+      '@rolldown/binding-win32-x64-msvc':
+        specifier: ^1.2.0
+        version: 1.2.0
       '@rollup/plugin-commonjs':
         specifier: ^28.0.1
         version: 28.0.9(rollup@4.59.0)
@@ -4933,6 +4936,12 @@ packages:
 
   '@rolldown/binding-win32-x64-msvc@1.0.0-rc.9':
     resolution: {integrity: sha512-G0oA4+w1iY5AGi5HcDTxWsoxF509hrFIPB2rduV5aDqS9FtDg1CAfa7V34qImbjfhIcA8C+RekocJZA96EarwQ==}
+    engines: {node: ^20.19.0 || >=22.12.0}
+    cpu: [x64]
+    os: [win32]
+
+  '@rolldown/binding-win32-x64-msvc@1.2.0':
+    resolution: {integrity: sha512-WfFv6/qGufotqBSBzBYwgpCkJBk8Nj7697LL9vTz/XWc67e0r3oewu8iMRwQj3AUL45GVD7wVsPjCsAAtW66Wg==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [win32]
@@ -17922,6 +17931,8 @@ snapshots:
 
   '@rolldown/binding-win32-x64-msvc@1.0.0-rc.9':
     optional: true
+
+  '@rolldown/binding-win32-x64-msvc@1.2.0': {}
 
   '@rolldown/pluginutils@1.0.0-rc.9': {}
 

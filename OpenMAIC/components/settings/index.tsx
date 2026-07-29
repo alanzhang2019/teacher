@@ -540,19 +540,17 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     let nextActiveModelId: string | undefined;
     if (modelIndex === null) {
       newModels = [...currentModels, model];
-      // Adding a brand-new model. If the user is on the *same* provider
-      // and the current modelId is no longer in (merged) list, adopt the
-      // freshly-added model — without this, the new entry would never be
-      // selected (the user would add e.g. `deepseek/deepseek-v4-pro-202606`
-      // to the DeepSeek card, save, and keep routing to the previous
-      // `deepseek/deepseek-v4-flash`).
-      // Read the live modelId from the store (not the closure-captured
-      // `_modelId`, which is intentionally underscored as unused).
-      const currentModelId = useSettingsStore.getState().modelId;
+      // Adding a brand-new model. The user just typed an id and saved —
+      // they almost certainly want to *use* it. Force-switch to the new
+      // id whenever adding to a *configured* provider, regardless of
+      // whether the current global modelId happens to be a different
+      // model on the same provider. Without this, adding
+      // `deepseek/deepseek-v4-pro-202606` to the DeepSeek card while the
+      // active model was the built-in `deepseek-v4-pro` would leave the
+      // running model unchanged, and the user would see requests still
+      // routed to the old id.
       if (
-        pid === providerId &&
-        !currentModels.some((m) => m.id === currentModelId) &&
-        !currentModels.some((m) => m.id === model.id)
+        isLLMProviderConfigured(useSettingsStore.getState().providersConfig[pid])
       ) {
         nextActiveModelId = model.id;
       }

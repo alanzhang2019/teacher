@@ -101,39 +101,51 @@ export async function POST(req: NextRequest) {
       userPrompt: string,
       images?: Array<{ id: string; src: string }>,
     ): Promise<string> => {
-      if (images?.length && hasVision) {
+      // 90s per attempt — large interactive/diagram prompts can take that
+      // long on qnaigc / 七牛云 proxies. Combined with `maxRetries: 2` below
+      // (default 2 for AI SDK) we get up to ~3 minutes total before the
+      // 500 fallback fires.
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), 90_000);
+      const callParams = {
+        model: languageModel,
+        system: systemPrompt,
+        maxRetries: 2,
+        abortSignal: abortController.signal,
+      };
+      try {
+        if (images?.length && hasVision) {
+          const result = await callLLM(
+            {
+              ...callParams,
+              messages: [
+                {
+                  role: 'user' as const,
+                  content: buildVisionUserContent(userPrompt, images),
+                },
+              ],
+              maxOutputTokens: modelInfo?.outputWindow,
+            },
+            'scene-content',
+            undefined,
+            thinkingConfig,
+          );
+          return result.text;
+        }
         const result = await callLLM(
           {
-            model: languageModel,
-            system: systemPrompt,
-            messages: [
-              {
-                role: 'user' as const,
-                content: buildVisionUserContent(userPrompt, images),
-              },
-            ],
+            ...callParams,
+            prompt: userPrompt,
             maxOutputTokens: modelInfo?.outputWindow,
-            maxRetries: 0,
           },
           'scene-content',
           undefined,
           thinkingConfig,
         );
         return result.text;
+      } finally {
+        clearTimeout(timeoutId);
       }
-      const result = await callLLM(
-        {
-          model: languageModel,
-          system: systemPrompt,
-          prompt: userPrompt,
-          maxOutputTokens: modelInfo?.outputWindow,
-          maxRetries: 0,
-        },
-        'scene-content',
-        undefined,
-        thinkingConfig,
-      );
-      return result.text;
     };
 
     // ── Apply fallbacks ──

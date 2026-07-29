@@ -403,6 +403,21 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
       baseUrl,
       requiresApiKey,
     });
+    // Adopting: when the user is editing the *currently selected* card and
+    // it remains usable, keep the running model in sync with what the user
+    // just typed in (in particular, if they re-saved with a different
+    // baseUrl / apiKey the active model routing must follow). And if the
+    // user is editing a *different* provider's card (e.g. they switched
+    // from openai to the DeepSeek card to add an apiKey) and that target
+    // is now usable, also flip the global (providerId, modelId) to it.
+    // Previously `setProviderConfig` only called `resolveLLMSelection`,
+    // which kept the current `state.providerId` when it was still usable
+    // — so editing another provider's config never switched the running
+    // model unless the user separately clicked the sidebar.
+    const merged = { ...providersConfig[pid], apiKey, baseUrl, requiresApiKey };
+    if (isLLMProviderConfigured(merged)) {
+      handleProviderSelect(pid);
+    }
   };
 
   const handleProviderConfigSave = () => {
@@ -516,13 +531,41 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     }
     const currentModels = providersConfig[pid]?.models || [];
     let newModels: typeof currentModels;
+    let nextActiveModelId: string | undefined;
     if (modelIndex === null) {
       newModels = [...currentModels, model];
+      // Adding a brand-new model. If the user is on the *same* provider
+      // and the current modelId is no longer in (merged) list, adopt the
+      // freshly-added model — without this, the new entry would never be
+      // selected (the user would add e.g. `deepseek/deepseek-v4-pro-202606`
+      // to the DeepSeek card, save, and keep routing to the previous
+      // `deepseek/deepseek-v4-flash`).
+      if (
+        pid === providerId &&
+        !currentModels.some((m) => m.id === modelId) &&
+        !currentModels.some((m) => m.id === model.id)
+      ) {
+        nextActiveModelId = model.id;
+      }
     } else {
       newModels = [...currentModels];
       newModels[modelIndex] = model;
     }
     setProviderConfig(pid, { models: newModels });
+    if (nextActiveModelId) {
+      setModel(pid, nextActiveModelId);
+    } else if (
+      modelIndex === null &&
+      pid !== providerId &&
+      isLLMProviderConfigured(useSettingsStore.getState().providersConfig[pid])
+    ) {
+      // Adding a model to a *different* provider also implies the user
+      // wants to use that provider — adopt the provider if it is now
+      // usable. Without this, the user would add a model to the DeepSeek
+      // card, save, and the running model would still be the openai
+      // provider's model.
+      handleProviderSelect(pid);
+    }
     setShowModelDialog(false);
     setEditingModel(null);
   };

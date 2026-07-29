@@ -384,8 +384,14 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
       // logic that `resolveSelectedLLMModel` applies in the store, so this
       // file does not depend on a (private) helper export.
       const available = refreshed.models ?? [];
+      // Read the live modelId from the store (not the closure-captured
+      // `_modelId`, which may be stale between renders) so we keep the
+      // user's current selection if it still resolves against the target.
+      const currentModelId = useSettingsStore.getState().modelId;
       const nextModelId =
-        (modelId && available.some((m) => m.id === modelId) && modelId) ||
+        (currentModelId &&
+          available.some((m) => m.id === currentModelId) &&
+          currentModelId) ||
         available[0]?.id ||
         '';
       if (nextModelId) setModel(pid, nextModelId);
@@ -540,9 +546,12 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
       // selected (the user would add e.g. `deepseek/deepseek-v4-pro-202606`
       // to the DeepSeek card, save, and keep routing to the previous
       // `deepseek/deepseek-v4-flash`).
+      // Read the live modelId from the store (not the closure-captured
+      // `_modelId`, which is intentionally underscored as unused).
+      const currentModelId = useSettingsStore.getState().modelId;
       if (
         pid === providerId &&
-        !currentModels.some((m) => m.id === modelId) &&
+        !currentModels.some((m) => m.id === currentModelId) &&
         !currentModels.some((m) => m.id === model.id)
       ) {
         nextActiveModelId = model.id;

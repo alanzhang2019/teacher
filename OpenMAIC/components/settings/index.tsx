@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useSettingsStore } from '@/lib/store/settings';
+import { isLLMProviderConfigured } from '@/lib/store/settings-validation';
 import { toast } from 'sonner';
 import { type ProviderId } from '@/lib/ai/providers';
 import { PROVIDERS, MONO_LOGO_PROVIDERS } from '@/lib/ai/providers';
@@ -238,6 +239,7 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
   const asrProvidersConfig = useSettingsStore((state) => state.asrProvidersConfig);
 
   // Store actions
+  const setModel = useSettingsStore((state) => state.setModel);
   const setProviderConfig = useSettingsStore((state) => state.setProviderConfig);
   const setProvidersConfig = useSettingsStore((state) => state.setProvidersConfig);
   const setTTSProvider = useSettingsStore((state) => state.setTTSProvider);
@@ -347,6 +349,27 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
 
   const handleProviderSelect = (pid: ProviderId) => {
     setSelectedProviderId(pid);
+    // Also adopt the provider in the zustand store when the user clicks it in
+    // the sidebar, so the running model immediately routes through this
+    // provider. Previously only `selectedProviderId` (local UI state) was
+    // updated, so clicking DeepSeek in the sidebar left the global
+    // (providerId, modelId) on `openai:...` until the user also re-saved the
+    // config — which is why client UI edits appeared to never take effect
+    // until the page was reloaded against a fully-configured provider.
+    // Only auto-adopt when the target is *already* configured; otherwise
+    // let the user finish editing without clobbering their active model.
+    const target = providersConfig[pid];
+    if (target && isLLMProviderConfigured(target)) {
+      // Inline the same "keep current model if it resolves; else first model"
+      // logic that `resolveSelectedLLMModel` applies in the store, so this
+      // file does not depend on a (private) helper export.
+      const available = target.models ?? [];
+      const nextModelId =
+        (modelId && available.some((m) => m.id === modelId) && modelId) ||
+        available[0]?.id ||
+        '';
+      if (nextModelId) setModel(pid, nextModelId);
+    }
   };
 
   const handleProviderConfigChange = (

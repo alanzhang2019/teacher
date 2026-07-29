@@ -356,14 +356,34 @@ export function SettingsDialog({ open, onOpenChange, initialSection }: SettingsD
     // (providerId, modelId) on `openai:...` until the user also re-saved the
     // config — which is why client UI edits appeared to never take effect
     // until the page was reloaded against a fully-configured provider.
-    // Only auto-adopt when the target is *already* configured; otherwise
-    // let the user finish editing without clobbering their active model.
+    //
+    // Auto-adopt the target when it is already configured, OR when the user
+    // has only just added a model to it but has not yet entered an API key.
+    // In that case, borrow the credentials of the first configured OpenAI-
+    // compatible peer (openai / siliconflow / openrouter / ...) so the user
+    // does not have to retype the same qnaigc / openai-compatible key into
+    // every provider card just to flip the active selection. The user can
+    // still override the borrowed key by typing in the API-key field.
     const target = providersConfig[pid];
-    if (target && isLLMProviderConfigured(target)) {
+    const borrowable = (Object.keys(providersConfig) as ProviderId[]).find((p) => {
+      const c = providersConfig[p];
+      return !!c && isLLMProviderConfigured(c) && p !== pid;
+    });
+    if (target && !isLLMProviderConfigured(target) && borrowable) {
+      const borrowed = providersConfig[borrowable];
+      setProviderConfig(pid, {
+        apiKey: target.apiKey || borrowed.apiKey || '',
+        baseUrl: target.baseUrl || borrowed.baseUrl || '',
+      });
+      // Fall through to the model-adopt branch using the *merged* config so
+      // the new selection picks the model the user just added to `target`.
+    }
+    const refreshed = useSettingsStore.getState().providersConfig[pid];
+    if (refreshed && isLLMProviderConfigured(refreshed)) {
       // Inline the same "keep current model if it resolves; else first model"
       // logic that `resolveSelectedLLMModel` applies in the store, so this
       // file does not depend on a (private) helper export.
-      const available = target.models ?? [];
+      const available = refreshed.models ?? [];
       const nextModelId =
         (modelId && available.some((m) => m.id === modelId) && modelId) ||
         available[0]?.id ||

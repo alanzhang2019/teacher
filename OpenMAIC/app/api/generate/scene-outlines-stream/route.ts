@@ -600,7 +600,7 @@ export async function POST(req: NextRequest) {
 
           if (parsedOutlines.length > 0) {
             // Replace sequential gen_img_N/gen_vid_N with globally unique IDs
-            let uniquifiedOutlines = uniquifyMediaElementIds(parsedOutlines);
+            const uniquifiedOutlines = uniquifyMediaElementIds(parsedOutlines);
             // [imageGen-trace] did the LLM actually emit mediaGenerations? Count per type.
             const withImg = uniquifiedOutlines.filter(
               (o) => Array.isArray(o.mediaGenerations) && o.mediaGenerations.some((m) => m.type === 'image'),
@@ -611,45 +611,6 @@ export async function POST(req: NextRequest) {
             log.info(
               `[imageGen-trace] LLM returned ${uniquifiedOutlines.length} outline(s); with-image=${withImg} with-video=${withVid} (header said image=${imageGenerationEnabled} video=${videoGenerationEnabled})`,
             );
-
-            // POST-PROCESS FALLBACK: when the user explicitly enabled image
-            // generation but the LLM emitted zero image requests, force-inject
-            // 1-2 generic prompts into the first few slide outlines. We saw
-            // this happen with deepseek-v4-flash on the "CSP初赛要点精讲
-            // 程序阅读题解题技巧" topic — the LLM skipped images even though
-            // imageEnabled was true and the system prompt says "MUST add".
-            // Forcing a few fallback requests keeps the user-visible toggle
-            // meaningful instead of silently producing a text-only course.
-            if (imageGenerationEnabled && withImg === 0) {
-              let forceInjected = 0;
-              for (let i = 0; i < Math.min(2, uniquifiedOutlines.length); i++) {
-                const outline = uniquifiedOutlines[i];
-                if (outline.type !== 'slide') continue;
-                if (!Array.isArray(outline.mediaGenerations)) {
-                  outline.mediaGenerations = [];
-                }
-                if (outline.mediaGenerations.some((m) => m.type === 'image')) continue;
-                const keyPointSummary = (outline.keyPoints || []).slice(0, 2).join('; ');
-                const prompt =
-                  i === 0
-                    ? `A clean, educational illustration that introduces the topic: "${outline.title}". Use diagrams, labels, or a relevant photo. All text in the image should be in the course language.`
-                    : `A labelled diagram or chart that explains one of these key points: ${keyPointSummary}. All text in the image should be in the course language.`;
-                outline.mediaGenerations.push({
-                  type: 'image',
-                  elementId: `gen_img_force_${i + 1}`,
-                  prompt,
-                  aspectRatio: '16:9',
-                });
-                forceInjected++;
-              }
-              if (forceInjected > 0) {
-                // Re-uniquify the freshly added IDs.
-                uniquifiedOutlines = uniquifyMediaElementIds(uniquifiedOutlines);
-                log.info(
-                  `[imageGen-trace] force-injected ${forceInjected} image request(s) (LLM emitted 0; user enabled image gen)`,
-                );
-              }
-            }
             // Send done event with all outlines
             const doneEvent = JSON.stringify({
               type: 'done',

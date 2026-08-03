@@ -516,7 +516,7 @@
     "retry": "重新答题"
   },
   "roundtable": {
-    "teacher": "教师",
+    "teacher": "AI 教师",
     "you": "你",
     "inputPlaceholder": "输入你的消息...",
     "listening": "录音中...",
@@ -895,6 +895,7 @@
     "sceneGenerateRateLimited": "场景生成触发限流，请稍后重试。",
     "sceneGenerateProviderUnavailable": "模型服务暂时不可用，请稍后重试。",
     "sceneGenerateInvalidResponse": "模型未返回有效的场景内容，请更换模型或调整课程需求后重试。",
+    "sceneGenerateTimeout": "场景生成超时，请重试 — 模型响应时间过长。",
     "reviewOutlineTitle": "审阅课程大纲",
     "reviewOutlineDesc": "可在生成内容前编辑、重排、删除或新增场景。",
     "reviewOutlineAutoContinue": "如不审阅，大纲生成后会自动继续生成课程内容。",
@@ -1019,7 +1020,7 @@
     "selectedAgents": "选中的智能体",
     "required": "必选",
     "agentNames": {
-      "default-1": "AI教师",
+      "default-1": "张老师",
       "default-2": "AI助教",
       "default-3": "显眼包",
       "default-4": "好奇宝宝",
@@ -1027,7 +1028,7 @@
       "default-6": "思考者"
     },
     "agentRoles": {
-      "teacher": "教师",
+      "teacher": "AI 教师",
       "assistant": "助教",
       "student": "学生"
     },

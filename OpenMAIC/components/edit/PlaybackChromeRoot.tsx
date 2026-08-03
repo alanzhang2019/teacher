@@ -98,6 +98,8 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       outlines,
     } = useStageStore();
     const failedOutlines = useStageStore.use.failedOutlines();
+    const failedOutlineErrors = useStageStore.use.failedOutlineErrors();
+    const failedOutlineErrorCodes = useStageStore.use.failedOutlineErrorCodes();
     const generationComplete = useStageStore.use.generationComplete();
 
     const currentScene = getCurrentScene();
@@ -1264,6 +1266,27 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
               isCourseComplete={isCourseComplete}
               isGenerationFailed={
                 isPendingScene && failedOutlines.some((f) => f.id === generatingOutlines[0]?.id)
+              }
+              generationFailureMessage={
+                isPendingScene && generatingOutlines[0]
+                  ? (() => {
+                      const outlineId = generatingOutlines[0].id;
+                      const errorCode = failedOutlineErrorCodes[outlineId];
+                      const raw = failedOutlineErrors[outlineId];
+                      if (errorCode === 'TIMEOUT') return t('generation.sceneGenerateTimeout');
+                      if (errorCode === 'RATE_LIMITED') return t('generation.sceneGenerateRateLimited');
+                      if (errorCode === 'UPSTREAM_ERROR' || errorCode === 'AUTH_FAILED') {
+                        return t('generation.sceneGenerateAuthFailed');
+                      }
+                      if (errorCode === 'PROVIDER_UNAVAILABLE') {
+                        return t('generation.sceneGenerateProviderUnavailable');
+                      }
+                      if (errorCode === 'GENERATION_FAILED') {
+                        return t('generation.sceneGenerateInvalidResponse');
+                      }
+                      return raw;
+                    })()
+                  : undefined
               }
               onRetryGeneration={
                 onRetryOutline && generatingOutlines[0]

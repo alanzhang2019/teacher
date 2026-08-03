@@ -895,6 +895,7 @@
     "sceneGenerateRateLimited": "シーン生成がレート制限されています。少し待ってからもう一度お試しください。",
     "sceneGenerateProviderUnavailable": "モデルプロバイダーが一時的に利用できません。しばらくしてからお試しください。",
     "sceneGenerateInvalidResponse": "モデルから有効なシーン内容が返されませんでした。別のモデルを試すか、コース要件を調整してください。",
+    "sceneGenerateTimeout": "シーン生成がタイムアウトしました。再試行してください — モデルの応答時間が長すぎます。",
     "reviewOutlineTitle": "アウトラインを確認",
     "reviewOutlineDesc": "コンテンツ生成の前に、シーンの編集、並び替え、削除、追加ができます。",
     "reviewOutlineAutoContinue": "確認しない場合は、自動的にコース内容の生成へ進みます。",

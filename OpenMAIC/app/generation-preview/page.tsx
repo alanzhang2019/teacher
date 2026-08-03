@@ -125,6 +125,7 @@ function GenerationPreviewContent() {
   const [session, setSession] = useState<GenerationSessionState | null>(null);
   const [sessionLoaded, setSessionLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [isComplete] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
@@ -167,6 +168,10 @@ function GenerationPreviewContent() {
 
     if (failure.errorCode === 'RATE_LIMITED' || failure.statusCode === 429) {
       return t('generation.sceneGenerateRateLimited');
+    }
+
+    if (failure.errorCode === 'TIMEOUT' || failure.statusCode === 504) {
+      return t('generation.sceneGenerateTimeout');
     }
 
     if (failure.errorCode === 'UPSTREAM_ERROR' && failure.statusCode && failure.statusCode >= 500) {
@@ -981,7 +986,8 @@ function GenerationPreviewContent() {
       );
 
       if (!contentData.success || !contentData.content) {
-        throw new Error(sceneGenerationErrorMessage(contentData));
+        const message = sceneGenerationErrorMessage(contentData);
+        throw Object.assign(new Error(message), { errorCode: contentData.errorCode });
       }
 
       // Generate actions (activate actions step indicator)
@@ -1101,7 +1107,17 @@ function GenerationPreviewContent() {
         return;
       }
       sessionStorage.removeItem('generationSession');
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      // Surface a structured `errorCode` so the failure card can show the
+      // root cause instead of a generic "please try again" — the previous
+      // behaviour hid INTERNAL_ERROR / GENERATION_FAILED / provider errors
+      // behind a single Chinese sentence, which made debugging impossible.
+      const failureCode =
+        err && typeof err === 'object' && 'errorCode' in err
+          ? ((err as { errorCode?: unknown }).errorCode as string | undefined)
+          : undefined;
+      setErrorCode(failureCode && typeof failureCode === 'string' ? failureCode : 'UNKNOWN');
+      setError(message);
     }
   };
 
@@ -1465,6 +1481,11 @@ function GenerationPreviewContent() {
                           ? t('generation.classroomReady')
                           : statusMessage || t(activeStepText.description)}
                     </p>
+                    {error && errorCode && (
+                      <p className="text-xs text-muted-foreground/70 font-mono">
+                        code: {errorCode}
+                      </p>
+                    )}
                   </motion.div>
                 </AnimatePresence>
 

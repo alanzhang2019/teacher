@@ -156,16 +156,61 @@ export async function fetchSceneContent(
           signal,
         });
 
-        const data = await readJsonResponse(response);
-        if (!response.ok) {
-          throw createHttpError(response, data, 'Scene content request failed');
+        // Non-SSE response = 4xx/5xx raised before the stream was opened
+        // (bad config, validation error, etc.). Parse as JSON and throw
+        // so the retry wrapper sees the status code.
+        const contentType = response.headers.get('content-type') ?? '';
+        if (!contentType.includes('text/event-stream')) {
+          const data = await readJsonResponse(response);
+          if (!response.ok) {
+            throw createHttpError(response, data, 'Scene content request failed');
+          }
+          return data as unknown as SceneContentResult;
         }
 
-        return data as unknown as SceneContentResult;
+        // SSE: walk events until we see `result` or `error`.
+        const events = await readSseEvents(response, signal);
+        let lastError: { errorCode?: string; error?: string; statusCode?: number } | null = null;
+        for await (const event of events) {
+          if (event.type === 'progress') {
+            continue;
+          }
+          if (event.type === 'result') {
+            return {
+              success: true,
+              content: event.content as unknown,
+              effectiveOutline: event.effectiveOutline as SceneOutline | undefined,
+            } as SceneContentResult;
+          }
+          if (event.type === 'error') {
+            lastError = {
+              errorCode: typeof event.errorCode === 'string' ? event.errorCode : undefined,
+              error: typeof event.error === 'string' ? event.error : undefined,
+              statusCode:
+                typeof event.statusCode === 'number' ? (event.statusCode as number) : 500,
+            };
+            // Keep reading so the connection drains.
+          }
+        }
+
+        if (lastError) {
+          throw createHttpError(
+            new Response(null, { status: lastError.statusCode ?? 500 }),
+            lastError,
+            lastError.error ?? 'Scene content generation failed',
+          );
+        }
+        throw new Error('Scene content stream ended without a result event');
       },
       {
         label: `scene content "${params.outline.title}"`,
         shouldRetryResult: (result) => !result.success || !result.content,
+        // Server-side streaming already handles AI SDK network retries
+        // (`maxRetries: 2` inside the route) plus stall detection, so any
+        // client-side retry would re-pay the full generation cost. Default
+        // to no client retry; specific call sites can still opt in via
+        // `retryOptions`.
+        maxRetries: 0,
         ...retryOptions,
         signal,
       },
@@ -178,6 +223,108 @@ export async function fetchSceneContent(
       ...errorMeta(error),
     };
   }
+}
+
+/**
+ * Read an SSE `text/event-stream` response from `fetch`. Yields each parsed
+ * data object. Honours `signal` — calling the reader's `cancel()` will close
+ * the upstream socket so the server sees the disconnect and aborts.
+ */
+async function readSseEvents(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<AsyncIterableIterator<{ type: string; [key: string]: unknown }>> {
+  if (!response.body) {
+    throw new Error('SSE response has no body');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const queue: Array<{ type: string; [key: string]: unknown }> = [];
+  let resolveNext: (() => void) | null = null;
+  let streamError: unknown = null;
+  let closed = false;
+
+  const onAbort = () => {
+    closed = true;
+    void reader.cancel().catch(() => {});
+    if (resolveNext) {
+      resolveNext();
+      resolveNext = null;
+    }
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  // Background pump: read chunks, split on \n\n, parse each "data: ..." event.
+  (async () => {
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) {
+          closed = true;
+          if (resolveNext) {
+            resolveNext();
+            resolveNext = null;
+          }
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buffer.indexOf('\n\n')) >= 0) {
+          const raw = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          // Skip SSE comments / heartbeats (lines beginning with ':').
+          if (raw.startsWith(':')) continue;
+          const dataLines = raw
+            .split('\n')
+            .filter((l) => l.startsWith('data:'))
+            .map((l) => l.slice(5).trimStart());
+          if (dataLines.length === 0) continue;
+          const dataStr = dataLines.join('\n');
+          if (dataStr === '[DONE]') continue;
+          try {
+            queue.push(JSON.parse(dataStr));
+          } catch {
+            // Malformed event — drop it rather than tearing the whole stream.
+          }
+        }
+        if (resolveNext) {
+          resolveNext();
+          resolveNext = null;
+        }
+      }
+    } catch (err) {
+      streamError = err;
+      closed = true;
+      if (resolveNext) {
+        resolveNext();
+        resolveNext = null;
+      }
+    }
+  })();
+
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next(): Promise<IteratorResult<{ type: string; [key: string]: unknown }>> {
+      while (queue.length === 0) {
+        if (signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (streamError) throw streamError;
+        if (closed) return { value: undefined as never, done: true };
+        await new Promise<void>((resolve) => {
+          resolveNext = resolve;
+        });
+      }
+      return { value: queue.shift()!, done: false };
+    },
+  };
 }
 
 /** Call POST /api/generate/scene-actions (step 2) */
@@ -205,16 +352,64 @@ export async function fetchSceneActions(
           signal,
         });
 
-        const data = await readJsonResponse(response);
-        if (!response.ok) {
-          throw createHttpError(response, data, 'Scene actions request failed');
+        // Non-SSE responses are 4xx/5xx before the stream is opened (e.g.
+        // validation errors, bad model config). Parse as JSON and bubble up
+        // an HttpError so the retry wrapper sees the status code.
+        const contentType = response.headers.get('content-type') ?? '';
+        if (!contentType.includes('text/event-stream')) {
+          const data = await readJsonResponse(response);
+          if (!response.ok) {
+            throw createHttpError(response, data, 'Scene actions request failed');
+          }
+          // Unexpected JSON success — treat as a one-shot result.
+          return data as unknown as SceneActionsResult;
         }
 
-        return data as unknown as SceneActionsResult;
+        // SSE: walk events until we see `result` or `error`.
+        const events = await readSseEvents(response, signal);
+        let lastError: { errorCode?: string; error?: string; statusCode?: number } | null = null;
+        for await (const event of events) {
+          if (event.type === 'progress') {
+            // Reserved for future UI hooks (progress bar, etc.).
+            continue;
+          }
+          if (event.type === 'result') {
+            return {
+              success: true,
+              scene: event.scene as Scene,
+              previousSpeeches: (event.previousSpeeches as string[] | undefined) ?? undefined,
+            };
+          }
+          if (event.type === 'error') {
+            lastError = {
+              errorCode: typeof event.errorCode === 'string' ? event.errorCode : undefined,
+              error: typeof event.error === 'string' ? event.error : undefined,
+              statusCode:
+                typeof event.statusCode === 'number' ? (event.statusCode as number) : 500,
+            };
+            // Keep reading so the connection drains, then throw.
+          }
+        }
+
+        // Stream ended without a result — surface the last error if any.
+        if (lastError) {
+          throw createHttpError(
+            new Response(null, { status: lastError.statusCode ?? 500 }),
+            lastError,
+            lastError.error ?? 'Scene actions generation failed',
+          );
+        }
+        throw new Error('Scene actions stream ended without a result event');
       },
       {
         label: `scene actions "${params.outline.title}"`,
         shouldRetryResult: (result) => !result.success || !result.scene,
+        // Server-side streaming already handles AI SDK network retries
+        // (`maxRetries: 2` inside the route) plus stall detection, so any
+        // client-side retry would re-pay the full generation cost. Default
+        // to no client retry; specific call sites can still opt in via
+        // `retryOptions`.
+        maxRetries: 0,
         ...retryOptions,
         signal,
       },
@@ -709,7 +904,14 @@ export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
               pausedByFailureOrAbort = true;
               break;
             }
-            store.getState().addFailedOutline(outline);
+            log.warn(
+              `[SceneGen] content failed for outline "${outline.title}" (order=${outline.order}): ${contentResult.error || 'unknown error'}`,
+            );
+            store.getState().addFailedOutline(
+              outline,
+              contentResult.error || 'Content generation failed',
+              contentResult.errorCode,
+            );
             options.onSceneFailed?.(outline, contentResult.error || 'Content generation failed');
             if (contentPromises) {
               // Parallel: surface the failure but keep going with the other scenes
@@ -810,7 +1012,11 @@ export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
               pausedByFailureOrAbort = true;
               break;
             }
-            store.getState().addFailedOutline(outline);
+            store.getState().addFailedOutline(
+              outline,
+              actionsResult.error || 'Actions generation failed',
+              actionsResult.errorCode,
+            );
             options.onSceneFailed?.(outline, actionsResult.error || 'Actions generation failed');
             store.getState().setGenerationStatus('paused');
             pausedByFailureOrAbort = true;
@@ -916,7 +1122,11 @@ export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
         );
 
         if (!contentResult.success || !contentResult.content) {
-          store.getState().addFailedOutline(outline);
+          store.getState().addFailedOutline(
+            outline,
+            contentResult.error || 'Content generation failed',
+            contentResult.errorCode,
+          );
           return;
         }
 
@@ -944,7 +1154,11 @@ export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
         );
 
         if (!actionsResult.success || !actionsResult.scene) {
-          store.getState().addFailedOutline(outline);
+          store.getState().addFailedOutline(
+            outline,
+            actionsResult.error || 'Actions generation failed',
+            actionsResult.errorCode,
+          );
           return;
         }
 
@@ -1000,7 +1214,10 @@ export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
         }
       } catch (err) {
         if (!isAbortError(err)) {
-          store.getState().addFailedOutline(outline);
+          store.getState().addFailedOutline(
+            outline,
+            err instanceof Error ? err.message : String(err),
+          );
         }
       }
     },

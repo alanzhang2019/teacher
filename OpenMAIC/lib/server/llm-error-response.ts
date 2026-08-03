@@ -1,8 +1,12 @@
 import { APICallError, RetryError } from 'ai';
 import { apiError } from '@/lib/server/api-response';
+import { isAbortError } from '@/lib/generation/generation-retry';
 
 const HTTP_ERROR_MIN = 400;
 const HTTP_ERROR_MAX = 599;
+
+/** Shared user-facing message for upstream call timeouts. */
+const TIMEOUT_MESSAGE = 'Scene generation timed out. Please try again.';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -56,14 +60,76 @@ function messageForStatus(status: number): string {
   return 'Upstream provider rejected the request.';
 }
 
+function extractErrorMessage(error: unknown, seen = new Set<unknown>()): string | undefined {
+  if (!error || seen.has(error)) return undefined;
+  seen.add(error);
+
+  if (!isRecord(error)) {
+    if (error instanceof Error) {
+      const direct = error.message?.trim();
+      if (direct) return direct;
+    }
+    return undefined;
+  }
+
+  // Prefer the deepest specific message: a generic wrapper like
+  // "Request failed" or "fetch failed" usually wraps a cause that
+  // contains the real diagnostic (ECONNREFUSED, DNS error, etc.).
+  if (typeof error.cause !== 'undefined') {
+    const nested = extractErrorMessage(error.cause, seen);
+    if (nested) return nested;
+  }
+  if (Array.isArray(error.errors)) {
+    for (const nested of error.errors) {
+      const msg = extractErrorMessage(nested, seen);
+      if (msg) return msg;
+    }
+  }
+  if (typeof error.lastError !== 'undefined') {
+    const nested = extractErrorMessage(error.lastError, seen);
+    if (nested) return nested;
+  }
+
+  if (error instanceof Error) {
+    const direct = error.message?.trim();
+    if (direct) return direct;
+  }
+  if (typeof error.message === 'string' && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (typeof error.error === 'string' && error.error.trim()) {
+    return error.error.trim();
+  }
+  if (isRecord(error.error) && typeof error.error.message === 'string' && error.error.message.trim()) {
+    return error.error.message.trim();
+  }
+
+  return undefined;
+}
+
 /**
  * Preserve a provider's HTTP semantics for client retry classification without
  * exposing provider response bodies, URLs, or credential-adjacent details.
+ *
+ * AbortError is treated as a server-side timeout: we map it to HTTP 504 with a
+ * dedicated `TIMEOUT` code so the UI can show a friendly "timed out" message
+ * instead of the raw "This operation was aborted" string.
+ *
+ * When no HTTP status can be recovered from the error chain we still surface the
+ * underlying message (e.g. "fetch failed", "ECONNREFUSED") so the UI can show
+ * a specific cause instead of a generic "please try again".
  */
 export function llmApiError(error: unknown) {
+  // AbortError → timeout. Check before statusFromError because the AbortError
+  // never carries a useful HTTP status.
+  if (isAbortError(error)) {
+    return apiError('TIMEOUT', 504, TIMEOUT_MESSAGE);
+  }
+
   const status = statusFromError(error);
   if (status === undefined) {
-    return apiError('INTERNAL_ERROR', 500, 'Scene generation failed. Please try again.');
+    const detail = extractErrorMessage(error) ?? 'Scene generation failed. Please try again.';
+    return apiError('INTERNAL_ERROR', 500, detail);
   }
 
   return apiError(

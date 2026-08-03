@@ -36,10 +36,21 @@ export class MockApi {
   /** Mock the scene content generation endpoint */
   async mockSceneContent(response = mockSceneContentResponse) {
     await this.page.route('**/api/generate/scene-content', (route) => {
+      // scene-content is now an SSE endpoint; emit a single `result` event.
+      const sseBody =
+        `data: ${JSON.stringify({
+          type: 'result',
+          content: response.content,
+          effectiveOutline: response.effectiveOutline,
+        })}\n\n`;
       route.fulfill({
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(response),
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        },
+        body: sseBody,
       });
     });
   }

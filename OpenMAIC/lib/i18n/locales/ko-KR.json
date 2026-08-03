@@ -895,6 +895,7 @@
     "sceneGenerateRateLimited": "장면 생성 요청이 속도 제한에 걸렸습니다. 잠시 후 다시 시도해주세요.",
     "sceneGenerateProviderUnavailable": "모델 제공자를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요.",
     "sceneGenerateInvalidResponse": "모델이 유효한 장면 콘텐츠를 반환하지 않았습니다. 다른 모델을 사용하거나 강좌 요구사항을 조정해주세요.",
+    "sceneGenerateTimeout": "장면 생성 시간이 초과되었습니다. 다시 시도해주세요 — 모델 응답 시간이 너무 깁니다.",
     "reviewOutlineTitle": "개요 검토",
     "reviewOutlineDesc": "내용 생성 전에 장면을 편집, 순서 변경, 삭제 또는 추가할 수 있습니다.",
     "reviewOutlineAutoContinue": "개요를 검토하지 않으면 생성이 자동으로 계속됩니다.",

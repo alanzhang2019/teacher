@@ -895,6 +895,7 @@
     "sceneGenerateRateLimited": "A geração da cena atingiu o limite de requisições. Aguarde um momento e tente novamente.",
     "sceneGenerateProviderUnavailable": "O provedor do modelo está temporariamente indisponível. Tente novamente mais tarde.",
     "sceneGenerateInvalidResponse": "O modelo não retornou conteúdo de cena válido. Tente outro modelo ou ajuste os requisitos do curso.",
+    "sceneGenerateTimeout": "A geração da cena excedeu o tempo limite. Tente novamente — o modelo demorou demais para responder.",
     "reviewOutlineTitle": "Revise seu roteiro",
     "reviewOutlineDesc": "Edite, reordene, remova ou adicione cenas antes do início da geração de conteúdo.",
     "reviewOutlineAutoContinue": "A geração continuará automaticamente, a menos que você revise o roteiro.",

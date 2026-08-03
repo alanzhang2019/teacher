@@ -111,6 +111,10 @@ interface StageState {
   generationStatus: 'idle' | 'generating' | 'paused' | 'completed' | 'error';
   currentGeneratingOrder: number;
   failedOutlines: SceneOutline[];
+  /** Last failure reason per outline id. Cleared on retry. Not persisted. */
+  failedOutlineErrors: Record<string, string>;
+  /** Last failure errorCode per outline id (e.g. 'TIMEOUT', 'RATE_LIMITED'). */
+  failedOutlineErrorCodes: Record<string, string>;
 
   // Actions
   setStage: (stage: Stage) => void;
@@ -132,7 +136,7 @@ interface StageState {
   setGenerationStatus: (status: 'idle' | 'generating' | 'paused' | 'completed' | 'error') => void;
   setCurrentGeneratingOrder: (order: number) => void;
   bumpGenerationEpoch: () => void;
-  addFailedOutline: (outline: SceneOutline) => void;
+  addFailedOutline: (outline: SceneOutline, error?: string, errorCode?: string) => void;
   clearFailedOutlines: () => void;
   retryFailedOutline: (outlineId: string) => void;
 
@@ -175,6 +179,8 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   generationStatus: 'idle' as const,
   currentGeneratingOrder: -1,
   failedOutlines: [],
+  failedOutlineErrors: {},
+  failedOutlineErrorCodes: {},
 
   // Actions
   setStage: (stage) => {
@@ -382,17 +388,31 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
 
   bumpGenerationEpoch: () => set((s) => ({ generationEpoch: s.generationEpoch + 1 })),
 
-  addFailedOutline: (outline) => {
+  addFailedOutline: (outline, error, errorCode) => {
     const existed = get().failedOutlines.some((o) => o.id === outline.id);
-    if (existed) return;
-    set({ failedOutlines: [...get().failedOutlines, outline] });
+    if (!existed) {
+      set({ failedOutlines: [...get().failedOutlines, outline] });
+    }
+    if (error) {
+      set({ failedOutlineErrors: { ...get().failedOutlineErrors, [outline.id]: error } });
+    }
+    if (errorCode) {
+      set({ failedOutlineErrorCodes: { ...get().failedOutlineErrorCodes, [outline.id]: errorCode } });
+    }
   },
 
-  clearFailedOutlines: () => set({ failedOutlines: [] }),
+  clearFailedOutlines: () =>
+    set({ failedOutlines: [], failedOutlineErrors: {}, failedOutlineErrorCodes: {} }),
 
   retryFailedOutline: (outlineId) => {
+    const errors = { ...get().failedOutlineErrors };
+    const codes = { ...get().failedOutlineErrorCodes };
+    delete errors[outlineId];
+    delete codes[outlineId];
     set({
       failedOutlines: get().failedOutlines.filter((o) => o.id !== outlineId),
+      failedOutlineErrors: errors,
+      failedOutlineErrorCodes: codes,
     });
   },
 
@@ -565,6 +585,8 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
       generationStatus: 'idle' as const,
       currentGeneratingOrder: -1,
       failedOutlines: [],
+      failedOutlineErrors: {},
+      failedOutlineErrorCodes: {},
       generatingOutlines: [],
     }));
     log.info('Store cleared');

@@ -99,6 +99,13 @@ function statusCodeFrom(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Error codes that the server returns with the response body. The client's
+ * `fetchSceneContent` decorates thrown errors with these, so we can use them
+ * to skip retries for failures that the same upstream will reproduce.
+ */
+const NON_RETRYABLE_ERROR_CODES = new Set(['TIMEOUT', 'INVALID_RESPONSE']);
+
 function messageFrom(value: unknown): string {
   if (value instanceof Error) return value.message;
   if (!isRecord(value)) return String(value);
@@ -135,6 +142,11 @@ export function isRetryableGenerationError(error: unknown, seen = new Set<unknow
   if (isRecord(error)) {
     const explicitRetryable = booleanField(error, 'isRetryable');
     if (explicitRetryable !== undefined) return explicitRetryable;
+
+    // Server-decorated error codes like TIMEOUT mean the same upstream will
+    // fail again — skip the retry loop and surface immediately.
+    const errorCode = stringField(error, 'errorCode');
+    if (errorCode && NON_RETRYABLE_ERROR_CODES.has(errorCode)) return false;
   }
 
   const statusCode = statusCodeFrom(error);

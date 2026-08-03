@@ -23,6 +23,8 @@ interface CanvasAreaProps extends CanvasToolbarProps {
   readonly isPendingScene?: boolean;
   readonly isCourseComplete?: boolean;
   readonly isGenerationFailed?: boolean;
+  /** Last failure reason for the currently-pending outline (if any). */
+  readonly generationFailureMessage?: string;
   readonly onRetryGeneration?: () => void;
 }
 
@@ -50,6 +52,7 @@ export function CanvasArea({
   isPendingScene,
   isCourseComplete,
   isGenerationFailed,
+  generationFailureMessage,
   onRetryGeneration,
 }: CanvasAreaProps) {
   const { t } = useI18n();
@@ -169,7 +172,7 @@ export function CanvasArea({
                 className="absolute inset-0 z-[105] flex flex-col items-center justify-center bg-white dark:bg-gray-800"
               >
                 {isGenerationFailed ? (
-                  <div className="flex flex-col items-center gap-3">
+                  <div className="flex flex-col items-center gap-3 max-w-md px-6">
                     <div className="w-12 h-12 rounded-full bg-red-50 dark:bg-red-900/20 flex items-center justify-center">
                       <svg
                         className="w-6 h-6 text-red-400 dark:text-red-500"
@@ -188,6 +191,14 @@ export function CanvasArea({
                     <span className="text-sm text-red-500 dark:text-red-400 font-medium">
                       {t('stage.generationFailed')}
                     </span>
+                    {generationFailureMessage && (
+                      <span
+                        className="text-xs text-gray-500 dark:text-gray-400 text-center break-words max-h-24 overflow-y-auto leading-relaxed"
+                        title={generationFailureMessage}
+                      >
+                        {generationFailureMessage}
+                      </span>
+                    )}
                     {onRetryGeneration && (
                       <button
                         onClick={onRetryGeneration}

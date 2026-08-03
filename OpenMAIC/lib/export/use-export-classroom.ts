@@ -27,6 +27,8 @@ import {
 import { createProxiedFetch } from './proxied-fetch';
 import type { SceneContent } from '@/lib/types/stage';
 import { preparePBLScenesForDocumentPersistence } from '@/lib/pbl/v2/runtime/document-persistence';
+import { useAgentRegistry } from '@/lib/orchestration/registry/store';
+import { useSettingsStore } from '@/lib/store/settings';
 
 export async function inlineSceneContent(
   content: SceneContent,
@@ -86,8 +88,21 @@ export function useExportClassroom() {
         updatedAt: stage.updatedAt,
       };
 
+      // Resolve agent name with this priority:
+      //   1. i18n key for the agent id (current locale)
+      //   2. Current registry's name (default agents updated at runtime)
+      //   3. Stored name in IndexedDB (last-resort fallback for renamed custom agents)
+      const registry = useAgentRegistry.getState();
+      const resolveAgentName = (storedName: string, agentId: string): string => {
+        const i18nName = t(`settings.agentNames.${agentId}`);
+        if (i18nName && i18nName !== `settings.agentNames.${agentId}`) return i18nName;
+        const regAgent = registry.getAgent(agentId);
+        if (regAgent?.name) return regAgent.name;
+        return storedName;
+      };
+
       const manifestAgents: ManifestAgent[] = agentRecords.map((a) => ({
-        name: a.name,
+        name: resolveAgentName(a.name, a.id),
         role: a.role,
         persona: a.persona,
         avatar: a.avatar,
@@ -99,7 +114,29 @@ export function useExportClassroom() {
       if (manifestAgents.length === 0 && stage.generatedAgentConfigs?.length) {
         for (const a of stage.generatedAgentConfigs) {
           manifestAgents.push({
-            name: a.name,
+            name: resolveAgentName(a.name, a.id),
+            role: a.role,
+            persona: a.persona,
+            avatar: a.avatar,
+            color: a.color,
+            priority: a.priority,
+          });
+        }
+      }
+
+      // Final fallback: pull from current in-memory registry + settings store.
+      // This matches the same source the browser's classroom view uses
+      // (useSettingsStore.selectedAgentIds + useAgentRegistry.agents).
+      // Without this, classrooms whose agents were never persisted to
+      // IndexedDB export with an empty agents array and the viewer falls
+      // back to a hardcoded "AI teacher" label.
+      if (manifestAgents.length === 0) {
+        const selectedIds = useSettingsStore.getState().selectedAgentIds;
+        for (const id of selectedIds) {
+          const a = registry.getAgent(id);
+          if (!a) continue;
+          manifestAgents.push({
+            name: resolveAgentName(a.name, a.id),
             role: a.role,
             persona: a.persona,
             avatar: a.avatar,
@@ -114,6 +151,9 @@ export function useExportClassroom() {
       agentRecords.forEach((a, i) => agentIdToIndex.set(a.id, i));
       if (stage.generatedAgentConfigs?.length && agentRecords.length === 0) {
         stage.generatedAgentConfigs.forEach((a, i) => agentIdToIndex.set(a.id, i));
+      }
+      if (agentIdToIndex.size === 0) {
+        manifestAgents.forEach((a, i) => agentIdToIndex.set(a.id, i));
       }
 
       const aggregateReport: InlineReport = { inlined: [], failed: [] };

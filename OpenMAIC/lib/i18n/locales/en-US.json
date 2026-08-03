@@ -895,6 +895,7 @@
     "sceneGenerateRateLimited": "Scene generation is rate limited. Please wait a moment and try again.",
     "sceneGenerateProviderUnavailable": "The model provider is temporarily unavailable. Please try again later.",
     "sceneGenerateInvalidResponse": "The model did not return valid scene content. Please try a different model or adjust the course requirements.",
+    "sceneGenerateTimeout": "Scene generation timed out. Please try again — the model took too long to respond.",
     "reviewOutlineTitle": "Review your outline",
     "reviewOutlineDesc": "Edit, reorder, remove, or add scenes before content generation begins.",
     "reviewOutlineAutoContinue": "Generation will continue automatically unless you review the outline.",
